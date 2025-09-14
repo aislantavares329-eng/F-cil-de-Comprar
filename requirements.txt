@@ -5,4 +5,3 @@ beautifulsoup4>=4.12
 lxml>=5.2
 extruct>=0.16
 w3lib>=2.2
-geopy>=2.4
