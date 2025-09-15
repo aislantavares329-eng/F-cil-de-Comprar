@@ -1,15 +1,10 @@
 # app.py — Comparador de encartes (PDF/JPG) por supermercado
-# - Upload de 2+ encartes (PDF/JPG/PNG)
-# - Extrai texto (PyMuPDF). Para imagens, tenta OCR (pytesseract ou easyocr, se disponíveis)
-# - Heurística para detectar "produto + preço" (R$ 3,59 / 2,99 / 12.99 etc.)
-# - Normaliza nomes, une variações e compara por supermercado
-# - Vence quem tiver MAIOR QUANTIDADE de produtos com menor preço
-# - Mostra o vencedor + lista dos menores preços por produto + tabelas
+# v2: detecção automática do nome do supermercado + amostra PT-BR + match mais robusto
 
-import sys, subprocess, importlib, io, os, re, unicodedata, math, tempfile
+import sys, subprocess, importlib, io, re, unicodedata
 from pathlib import Path
 
-# ---------- bootstrap leve de dependências ----------
+# ---------- deps ----------
 REQS = [
     ("streamlit", "streamlit>=1.34"),
     ("pandas", "pandas>=2.0"),
@@ -40,17 +35,18 @@ try:
 except Exception:
     pass
 try:
-    import easyocr  # pesado; só cria reader se for usar
+    import easyocr
     HAS_EASYOCR = True
 except Exception:
     pass
 
-# ---------------- utils ----------------
+# ---------- utils ----------
 STOP = {
     "kg","un","unidade","unidades","lt","l","ml","g","gr","gramas","litro","litros",
     "cada","pacote","bandeja","caixa","garrafa","lata","sachê","sache","pct","pcte",
     "ou","e","de","da","do","dos","das","para","pronta","pronto","congelado","resfriado",
-    "tipo","sabores","vários","varios","pre-frita","pré-frita","integral","tradicional"
+    "tipo","sabores","vários","varios","pré-frita","pre-frita","integral","tradicional",
+    "oferta","ofertas","promo","promoção","promocao","clube","clube de descontos","economia"
 }
 def norm_txt(s:str)->str:
     s = unicodedata.normalize("NFD", s or "").lower()
@@ -58,26 +54,16 @@ def norm_txt(s:str)->str:
     s = " ".join(s.split())
     return s
 
-PRICE_RE = re.compile(
-    r"(?:r\$\s*)?((?:\d{1,3}(?:[\.\s]\d{3})*|\d+)[,\.]\d{2})",
-    re.I
-)
-# também aceitar inteiros tipo "2,99" (já cobre) e "129,90"
-# nota: a vírgula/ ponto decimal será normalizada depois
+PRICE_RE = re.compile(r"(?:r\$\s*)?((?:\d{1,3}(?:[\.\s]\d{3})*|\d+)[,\.]\d{2})", re.I)
 
 def to_float_price(s:str):
     if not s: return None
-    s = s.replace(" ", "")
-    s = s.replace("R$", "").replace("r$", "")
-    # 1.234,56 -> 1234.56
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and "." not in s:
-        s = s.replace(",", ".")
+    s = s.replace(" ", "").replace("R$","").replace("r$","")
+    if "," in s and "." in s: s = s.replace(".","").replace(",",".")
+    elif "," in s: s = s.replace(",",".")
     try:
         v = float(s)
-        if 0 < v < 100000:
-            return v
+        if 0 < v < 100000: return v
     except Exception:
         return None
     return None
@@ -98,88 +84,121 @@ def parse_size(text:str):
 
 def canonical_name(raw:str):
     n = norm_txt(raw)
-    # tira "ruído" comum de encarte
-    n = re.sub(r"\b(r|rs)\$?\s*\d+[.,]\d{2}\b", " ", n)
-    n = re.sub(r"\bpromo(ção|cao)?\b", " ", n)
+    n = re.sub(PRICE_RE, " ", n)
+    n = n.replace(" r ", " ")
     n = " ".join(w for w in n.split() if w not in STOP and not w.isdigit())
-    n = " ".join(n.split())
+    n = n.strip("-_., ")
     return n
 
 def fuse_keys(a, b, thresh=90):
-    """decide se a e b são o 'mesmo' produto (nome e tamanho próximos)"""
-    s = fuzz.token_set_ratio(a, b)
-    return s >= thresh
+    return fuzz.token_set_ratio(a, b) >= thresh
 
-# ---------------- extração de texto ----------------
-def pdf_to_text(file_bytes: bytes):
+# ---------- extração ----------
+def pdf_to_text_and_img0(file_bytes: bytes):
+    """Retorna texto completo e, para detecção de marca, também o texto da primeira página em alta prioridade."""
     text_parts=[]
+    header_text=""
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-        for pg in doc:
-            # tenta texto nativo
-            t = pg.get_text("text")
-            t = t.strip()
+        for idx, pg in enumerate(doc):
+            t = pg.get_text("text").strip()
             if t:
                 text_parts.append(t)
+                if idx == 0: header_text = t
                 continue
-            # fallback: render + OCR
-            pix = pg.get_pixmap(dpi=220)
+            # fallback OCR
+            pix = pg.get_pixmap(dpi=230)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            text_parts.append(ocr_image(img))
-    return "\n".join(text_parts)
+            ocrt = ocr_image(img)
+            text_parts.append(ocrt)
+            if idx == 0: header_text = ocrt
+    return "\n".join(text_parts), header_text
 
 def ocr_image(img: Image.Image) -> str:
     if HAS_TESS:
-        try:
-            return pytesseract.image_to_string(img, lang="por")
-        except Exception:
-            pass
+        try: return pytesseract.image_to_string(img, lang="por")
+        except Exception: pass
     if HAS_EASYOCR:
         try:
             reader = easyocr.Reader(["pt"], gpu=False)
             res = reader.readtext(np.array(img), detail=0)
             return "\n".join(res)
-        except Exception:
-            pass
-    return ""  # sem OCR disponível
+        except Exception: pass
+    return ""
 
 def image_to_text(file_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except Exception:
-        return ""
+        return "", ""
     t = ocr_image(img)
-    return t
+    return t, t  # usa o mesmo texto como "header"
 
-# ---------------- parsing de produtos/preços ----------------
+# ---------- detecção do nome do supermercado ----------
+KNOWN_STORES = [
+    "frangolandia","frangolândia","mix mateus","mateus","centerbox","são luiz","sao luiz",
+    "carrefour","assai","atacadão","atacadao","pao de acucar","pão de açúcar",
+    "super lagoa","guanabara","bahamas","mart minas","bh supermercados","comper",
+    "cometa","mundial","angeloni","big","macro","fort atacadista","dia","extra"
+]
+def detect_market_name(full_text:str, header_text:str, filename:str):
+    def pick(lines):
+        # 1) bate nomes conhecidos
+        for ln in lines:
+            n = norm_txt(ln)
+            for k in KNOWN_STORES:
+                if k in n:
+                    return k
+        # 2) heurística: linha com poucas palavras, quase toda maiúscula e sem números
+        best=None; score=0
+        for ln in lines:
+            raw = ln.strip()
+            if len(raw)<3 or len(raw)>40: continue
+            if any(ch.isdigit() for ch in raw): continue
+            upper_ratio = sum(1 for c in raw if c.isalpha() and c==c.upper()) / max(1,sum(1 for c in raw if c.isalpha()))
+            if upper_ratio>0.6:
+                s = len(raw)
+                if s>score:
+                    score=s; best=raw
+        if best: return norm_txt(best)
+        return None
+
+    lines_header = [ln.strip() for ln in (header_text or "").splitlines() if ln.strip()]
+    lines_full   = [ln.strip() for ln in (full_text or "").splitlines()[:150] if ln.strip()]
+
+    name = pick(lines_header) or pick(lines_full)
+    if name: 
+        # polir: "mix mateus" > "mix mateus", "frangolandia" etc
+        return name
+    # fallback: nome do arquivo
+    return norm_txt(Path(filename).stem.replace("_"," ").replace("-"," "))
+
+# ---------- parsing de produtos/preços ----------
 def parse_products(text: str):
-    """
-    Heurística: vasculha linhas; para cada preço encontrado, captura
-    o trecho de nome mais próximo (na mesma linha ou vizinhas).
-    Retorna lista de dicts {name, price, size_g, size_ml, line}
-    """
     items=[]
+    if not text: return items
     lines = [ln.strip() for ln in text.splitlines()]
     for i, ln in enumerate(lines):
         if not ln: continue
-        # junta uma “linha estendida” com a anterior e a próxima (muito comum no encarte)
         ctx = " ".join([lines[i-1] if i>0 else "", ln, lines[i+1] if i+1<len(lines) else ""])
         for m in PRICE_RE.finditer(ctx):
-            rawp = m.group(1)
-            price = to_float_price(rawp)
+            price = to_float_price(m.group(1))
             if not price: continue
-            # nome candidato = remove preço do contexto e pega ~8-12 palavras em volta
-            left = ctx[:m.start()].strip()[-120:]
-            right = ctx[m.end():].strip()[:80]
-            # favorece termos do lado esquerdo
+            # montar nome candidato
+            left = ctx[:m.start()].strip()[-140:]
+            right = ctx[m.end():].strip()[:90]
             name = (left + " " + right).strip()
             name = re.sub(PRICE_RE, " ", name)
             name = re.sub(r"\b(?:cada|quilo|kg|unidade|un|pacote|bandeja)\b", " ", name, flags=re.I)
-            name = " ".join(name.split())
-            # política: nome mínimo
-            if len(name) < 3: 
-                # tenta somente a linha atual
-                name = re.sub(PRICE_RE, " ", ln).strip()
-            size_g, size_ml = parse_size(ctx)
+            name = name.strip(" -._")
+            # se ficou curto demais, tenta linha pura
+            if len(name) < 4:
+                name = re.sub(PRICE_RE, " ", ln).strip(" -._")
+            # se o "nome" virou só tamanho (ex: "100g 100g"), descarta
+            ncan = canonical_name(name)
+            size_g, size_ml = parse_size(name)
+            only_size = (len(re.sub(r"[^\w]", "", ncan)) < 3) and (size_g or size_ml)
+            if only_size: 
+                continue
             items.append({
                 "name_raw": name,
                 "price": price,
@@ -187,17 +206,13 @@ def parse_products(text: str):
                 "size_ml": size_ml,
                 "line": ln
             })
-    # limpeza básica: descarta absurdos e duplicatas idênticas
-    dedup=[]
-    seen=set()
+    # dedup simples
+    out=[]; seen=set()
     for it in items:
-        if it["price"]<=0 or it["price"]>10000: 
-            continue
         k=(it["name_raw"], round(it["price"],2))
-        if k in seen: 
-            continue
-        seen.add(k); dedup.append(it)
-    return dedup
+        if k in seen: continue
+        seen.add(k); out.append(it)
+    return out
 
 def build_key(name, size_g, size_ml):
     base = canonical_name(name)
@@ -208,13 +223,8 @@ def build_key(name, size_g, size_ml):
     return key or base or name
 
 def unify_keys(rows, thresh=90):
-    """
-    Agrupa chaves (nomes canônicos) muito parecidas.
-    Retorna mapeamento key->root_key.
-    """
     keys = list({r["key"] for r in rows})
-    roots=[]
-    mapping={}
+    roots=[]; mapping={}
     for k in keys:
         found=None
         for r in roots:
@@ -226,13 +236,8 @@ def unify_keys(rows, thresh=90):
             mapping[k]=found
     return mapping
 
-# ---------------- comparação ----------------
+# ---------- comparação ----------
 def compare_price_table(all_rows):
-    """
-    all_rows: list de dicts com:
-      market, key_root, name_raw, price
-    """
-    # pivot: produto x supermercado (menor preço de cada)
     markets = sorted({r["market"] for r in all_rows})
     products = sorted({r["key_root"] for r in all_rows})
     table=[]
@@ -243,62 +248,55 @@ def compare_price_table(all_rows):
             row[m] = min(vals) if vals else np.nan
         table.append(row)
     df = pd.DataFrame(table)
-    # vencedores por linha
     winners=[]
     for _,r in df.iterrows():
         vals = [(m, r[m]) for m in markets if pd.notna(r[m])]
-        if not vals: 
-            winners.append(None); continue
+        if not vals: winners.append(None); continue
         minp = min(v for _,v in vals)
         ws = sorted([m for m,v in vals if v==minp])
         winners.append(ws)
     df["Vencedor(es)"] = winners
-    # placar
     placar={m:0 for m in markets}
     for ws in winners:
         if not ws: continue
-        # critério do usuário: ganha quem tiver MAIOR QUANTIDADE de menores preços.
-        if len(ws)==1:
-            placar[ws[0]] += 1
+        if len(ws)==1: placar[ws[0]] += 1
         else:
-            # empate naquela linha: dá 0.5 pra cada pra não enviesar
-            for m in ws:
-                placar[m] += 0.5
-    # vencedor geral
+            for m in ws: placar[m]+=0.5
     best = max(placar.items(), key=lambda kv: kv[1])[0] if placar else None
     return df, placar, best
 
-# ---------------- UI ----------------
+# ---------- UI ----------
 st.set_page_config(page_title="Comparador de Encartes (PDF/JPG)", layout="wide")
-st.title("🧾🛒 Comparador de encartes — PDF/JPG → menor preço por supermercado")
+st.title("🧾🛒 Comparador de encartes — menor preço por supermercado")
 
-st.markdown("Carregue **2 ou mais** encartes (PDF/JPG/PNG). Dê um nome para cada supermercado.")
-
-uploads = st.file_uploader("Arraste seus encartes aqui (PDF/JPG/PNG)", 
-                           type=["pdf","jpg","jpeg","png"], accept_multiple_files=True)
+uploads = st.file_uploader(
+    "Envie 2 ou mais encartes (PDF/JPG/PNG). O app detecta o nome do supermercado automaticamente.",
+    type=["pdf","jpg","jpeg","png"], accept_multiple_files=True
+)
 
 if uploads:
-    st.subheader("Nomeie cada encarte (supermercado)")
-    market_names={}
-    for f in uploads:
-        default = Path(f.name).stem[:32]
-        market_names[f.name] = st.text_input(f"Nome do mercado para **{f.name}**", value=default)
-
     if st.button("Comparar preços"):
         all_rows=[]
-        with st.spinner("Lendo encartes e extraindo preços…"):
+        with st.spinner("Lendo encartes e identificando mercados…"):
+            market_of_file={}
+            parsed_cache={}
             for f in uploads:
-                market = (market_names.get(f.name) or Path(f.name).stem).strip()
                 data = f.read()
-                # extrai texto
                 ext = Path(f.name).suffix.lower()
                 if ext==".pdf":
-                    text = pdf_to_text(data)
+                    full_text, header = pdf_to_text_and_img0(data)
                 else:
-                    text = image_to_text(data)
-                # parse
-                items = parse_products(text)
-                # monta chaves
+                    full_text, header = image_to_text(data)
+                market = detect_market_name(full_text, header, f.name)
+                market_of_file[f.name] = market or Path(f.name).stem
+                parsed_cache[f.name] = (full_text, header)
+
+        with st.spinner("Extraindo produtos e preços…"):
+            for f in uploads:
+                market = market_of_file[f.name]
+                full_text, _ = parsed_cache[f.name]
+                items = parse_products(full_text)
+
                 rows=[]
                 for it in items:
                     key = build_key(it["name_raw"], it["size_g"], it["size_ml"])
@@ -308,56 +306,59 @@ if uploads:
                         "name_raw": it["name_raw"],
                         "price": float(it["price"]),
                     })
-                # unifica chaves parecidas DENTRO do encarte (evita duplicados do mesmo item)
-                mapping = unify_keys(rows, thresh=92)
+                # unificação DENTRO do encarte (um pouco rígida)
+                mapping = unify_keys(rows, thresh=90)
                 for r in rows:
                     r["key_root"] = mapping[r["key"]]
                 all_rows.extend(rows)
 
         if not all_rows:
-            st.error("Não achei preços nos arquivos (se forem só-imagem, instale OCR: *tesseract-ocr* + `pytesseract`, ou `easyocr`).")
+            st.error("Não consegui achar preços nos encartes. Se forem só-imagem, instale OCR (pytesseract ou easyocr).")
             st.stop()
 
-        # unifica chaves parecidas ACROSS encartes (quase mesmo produto entre mercados)
-        cross_map = unify_keys(all_rows, thresh=90)
+        # unificação ENTRE encartes (mais permissiva — era aqui que travava a comparação)
+        cross_map = unify_keys(all_rows, thresh=82)
         for r in all_rows:
             r["key_root"] = cross_map[r["key_root"]]
 
         df_all = pd.DataFrame(all_rows)
-        st.write("**Amostra de itens detectados (limpeza + normalização aplicada):**")
-        st.dataframe(df_all.head(40), use_container_width=True)
+
+        # ---- Amostra PT-BR: só Supermercado, Produto, Preço ----
+        amostra = df_all.rename(columns={
+            "market":"Supermercado",
+            "name_raw":"Produto",
+            "price":"Preço"
+        })[["Supermercado","Produto","Preço"]].copy()
+        amostra["Preço"] = amostra["Preço"].map(lambda v: f"R$ {v:.2f}")
+        st.subheader("Amostra de itens detectados")
+        st.dataframe(amostra.head(50), use_container_width=True)
 
         comp, placar, vencedor = compare_price_table(all_rows)
 
         st.markdown("## 🏁 Resultado")
         if vencedor:
-            st.success(f"**Supermercado vencedor:** {vencedor} — (mais itens com menor preço).")
+            st.success(f"**Supermercado vencedor:** {vendedor} — mais itens com menor preço.")
         else:
-            st.warning("Não deu pra decidir um vencedor (pouca interseção entre os encartes).")
+            st.warning("Sem vencedor claro (pouca interseção entre os encartes).")
 
         st.markdown("### Placar (quantidade de menores preços)")
         st.write(pd.DataFrame([placar]))
 
         st.markdown("### Tabela comparativa (menores preços por produto)")
-        # formatação amigável de preços
         comp_fmt = comp.copy()
         for col in comp.columns:
             if col not in ("Produto","Vencedor(es)"):
                 comp_fmt[col] = comp[col].apply(lambda v: f"R$ {v:.2f}" if pd.notna(v) else "—")
         st.dataframe(comp_fmt, use_container_width=True)
 
-        # lista final pedida: “nome do supermercado com menor preço” + cada produto com preço baixo
+        # Lista final: produto + menor preço + supermercado(s)
         st.markdown("### 🧾 Lista final — produtos e respectivos menores preços")
         linhas=[]
         for _, r in comp.iterrows():
-            # pega menor preço e o(s) vencedor(es)
             ws = r["Vencedor(es)"]
-            if not ws: 
-                continue
+            if not ws: continue
             cols = [c for c in comp.columns if c not in ("Produto","Vencedor(es)")]
-            # menor preço
             minp = np.nanmin([r[c] for c in cols if pd.notna(r[c])])
-            # se houver múltiplos vencedores, lista todos
             linhas.append({
                 "Produto": r["Produto"],
                 "Menor preço": f"R$ {minp:.2f}",
@@ -365,9 +366,8 @@ if uploads:
             })
         st.dataframe(pd.DataFrame(linhas), use_container_width=True)
 
-        # download CSV
         csv = comp.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Baixar comparação (CSV)", data=csv, file_name="comparacao_encartes.csv", mime="text/csv")
 
 else:
-    st.info("Carregue os encartes para começar.")
+    st.info("Envie os encartes para começar.")
