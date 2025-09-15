@@ -1,10 +1,11 @@
 # app.py — Comparador “cola o link e vai” (2 supermercados)
-# Usuário cola 2 URLs de listagem (ou qualquer página) e, opcionalmente, um CEP.
-# O app abre as URLs num Chromium headless (Playwright), tenta selecionar loja pelo CEP (se houver modal),
-# dá scroll para carregar os cards, extrai (nome, preço), mapeia para as SEÇÕES e compara.
+# Usuário cola 2 URLs; CEP opcional pra destravar preço se houver modal de loja.
+# Playwright com auto-instalação do Chromium + flags anti-sandbox/dev-shm.
+# Fallback: requests_html (render JS leve) se o browser falhar.
 
-import re, unicodedata, time
+import os, re, unicodedata, subprocess
 from urllib.parse import urlparse
+
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -128,7 +129,122 @@ def match_canonical(prod_name: str):
             return section, item["key"]
     return None, None
 
-# ------------------- Playwright: abre URL, tenta CEP, coleta cards -------------------
+# ------------------- Playwright: garantir Chromium + abrir URL -------------------
+def ensure_chromium_installed():
+    """Garante o browser do Playwright. Idempotente/silencioso."""
+    try:
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium", "--with-deps"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        try:
+            subprocess.run(
+                ["python", "-m", "playwright", "install", "chromium"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception:
+            pass
+
+def try_select_store(page, cep: str):
+    """Se aparecer modal de loja/CEP, tenta preencher e confirmar. Ignora erros."""
+    if not cep: return
+    try:
+        # clica em botões típicos que abrem seletor
+        texts = ["Selecione", "Entrega", "Retirada", "loja", "Definir", "Selecionar", "Confirmar", "Endereço"]
+        for t in texts:
+            loc = page.get_by_role("button", name=re.compile(t, re.I)).first
+            if loc and loc.is_visible():
+                loc.click()
+                page.wait_for_timeout(800)
+                break
+    except Exception:
+        pass
+    # preencher CEP
+    try:
+        page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep)
+    except Exception:
+        try:
+            page.locator("input[type=tel]").first.fill(cep)
+        except Exception:
+            pass
+    # confirmar/usar
+    try:
+        page.get_by_role("button", name=re.compile("Buscar|Confirmar|Aplicar|Usar|OK|Continuar|Salvar", re.I)).first.click()
+        page.wait_for_timeout(1200)
+    except Exception:
+        pass
+    # selecionar a primeira loja se houver
+    try:
+        page.get_by_role("button", name=re.compile("Selecionar|Escolher|Retirar|Usar esta loja", re.I)).first.click()
+        page.wait_for_timeout(1200)
+    except Exception:
+        pass
+
+def scroll_load(page, rounds=16):
+    for _ in range(rounds):
+        page.mouse.wheel(0, 1800)
+        page.wait_for_timeout(500)
+
+def fetch_with_browser(url: str, cep: str):
+    """
+    Abre a URL no Chromium headless; se aparecer modal de loja, tenta CEP;
+    rola a página e devolve o HTML final. Se falhar, usa fallback requests_html.
+    """
+    ensure_chromium_installed()
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-zygote",
+                    "--single-process",
+                ],
+            )
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(25000)
+
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+            except PwTimeout:
+                pass
+
+            # tenta destravar loja por CEP (se houver modal)
+            try_select_store(page, cep)
+
+            # se não for listagem, tenta clicar em “Ofertas/Clube/Promoções”
+            try:
+                if not re.search(r"oferta|clube|promo|categoria|horti|merce|busca", page.url, re.I):
+                    link = page.get_by_role("link", name=re.compile("Ofertas|Clube|Promo", re.I)).first
+                    if link and link.is_visible():
+                        link.click()
+                        page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            scroll_load(page, rounds=16)
+            html = page.content()
+            context.close(); browser.close()
+            return html
+
+    except Exception:
+        # fallback JS leve
+        try:
+            from requests_html import HTMLSession
+            sess = HTMLSession()
+            r = sess.get(url, timeout=30)
+            r.html.render(timeout=50, sleep=5, scrolldown=12)
+            return r.html.html
+        except Exception:
+            return ""
+
+# ------------------- Extração dos cards -------------------
 PRICE_SEL = (
     '.vtex-product-price-1-x-sellingPriceValue, '
     '.best-price, .price, [class*="price"], [data-price]'
@@ -137,47 +253,6 @@ NAME_SEL = (
     '.vtex-product-summary-2-x-productBrand, '
     '.product-title, .name, h3, h2, [itemprop="name"], [data-name]'
 )
-
-def try_select_store(page, cep: str):
-    """Se aparecer modal de loja/CEP, tenta preencher e confirmar. Ignora erros."""
-    if not cep: return
-    try:
-        # botões que costumam abrir modal
-        btns = page.get_by_role("button")
-        texts = ["Selecione", "Entrega", "Retirada", "loja", "Definir", "Selecionar", "Confirmar", "Endereço"]
-        for t in texts:
-            loc = btns.filter(has_text=re.compile(t, re.I)).first
-            if loc and loc.is_visible():
-                loc.click()
-                page.wait_for_timeout(800)
-                break
-    except Exception:
-        pass
-    # preencher CEP em qualquer input que pareça ser CEP
-    try:
-        page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep)
-    except Exception:
-        try:
-            page.locator("input[type=tel]").first.fill(cep)
-        except Exception:
-            pass
-    # confirmar
-    try:
-        page.get_by_role("button", name=re.compile("Buscar|Confirmar|Aplicar|Usar|OK|Continuar|Salvar", re.I)).first.click()
-        page.wait_for_timeout(1200)
-    except Exception:
-        pass
-    # selecionar a primeira loja se houver lista
-    try:
-        page.get_by_role("button", name=re.compile("Selecionar|Escolher|Retirar|Usar esta loja", re.I)).first.click()
-        page.wait_for_timeout(1200)
-    except Exception:
-        pass
-
-def scroll_load(page, rounds=14):
-    for _ in range(rounds):
-        page.mouse.wheel(0, 1800)
-        page.wait_for_timeout(500)
 
 def extract_cards(html: str):
     items=[]
@@ -214,41 +289,11 @@ def extract_cards(html: str):
             dedup.append(it); seen.add(k)
     return dedup
 
-def fetch_with_browser(url: str, cep: str):
-    """Abre exatamente a URL; se aparecer modal de loja, tenta CEP; rola e devolve HTML final."""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-        page.set_default_timeout(25000)
-        try:
-            page.goto(url, wait_until="domcontentloaded")
-        except PwTimeout:
-            # tenta carregar mesmo assim
-            pass
-
-        # se pedir loja: tentar CEP
-        try_select_store(page, cep)
-
-        # se a página não for claramente de listagem, tenta clicar em “Ofertas/Clube/Promoções”
-        try:
-            if not re.search(r"oferta|clube|promo|categoria|horti|merce|busca", page.url, re.I):
-                link = page.get_by_role("link", name=re.compile("Ofertas|Clube|Promo", re.I)).first
-                if link and link.is_visible():
-                    link.click()
-                    page.wait_for_timeout(1500)
-        except Exception:
-            pass
-
-        scroll_load(page, rounds=16)
-        html = page.content()
-        context.close(); browser.close()
-        return html
-
 # ------------------- Comparação -------------------
 def map_prices(items):
     mapped={}
     for it in items:
+        # mapeia pro catálogo (pega o menor preço por item)
         sec,key = match_canonical(it["name"])
         if not sec: 
             continue
@@ -270,7 +315,7 @@ if go:
     items2 = extract_cards(html2)
 
     if not items1 and not items2:
-        st.error("Não consegui ler preços nessas URLs (página pode exigir login rígido ou mudou o HTML). Me mande os links que ajusto os seletores.")
+        st.error("Não consegui ler preços nessas URLs (pode exigir login rígido ou o HTML mudou). Me mande os links que ajusto os seletores.")
         st.stop()
 
     name1 = urlparse(url1).netloc.replace("www.","")
