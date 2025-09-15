@@ -1,8 +1,10 @@
-# app.py — Comparador “cole os links e pronto” (2 supermercados)
-# Seletores específicos para Centerbox (/clube) e São Luiz (/ofertas) + captura XHR/JSON.
-# Funciona mesmo se você colar /loja/XX: ele redireciona pro caminho certo.
+# app.py — Comparador “cole os links e pronto” (Centerbox + São Luiz)
+# - Trata /loja/XX: aceita cookies, seleciona loja, define CEP, redireciona p/ /clube ou /ofertas
+# - Espera seletor de preço, scroll, clica "ver mais"
+# - Captura HTML e XHR/JSON (VTEX), com log de URLs úteis p/ debug
+# - Fallback requests_html se o Chromium não subir
 
-import re, json, unicodedata, subprocess
+import re, json, unicodedata, subprocess, time
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -12,7 +14,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
 # ------------------- UI -------------------
 st.set_page_config(page_title="Comparador de Supermercados (link direto)", layout="wide")
-st.title("🛒 Comparador — cole os links e pronto")
+st.title("🛒 Comparador — cole os links, opcionalmente um CEP, e pronto")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -31,7 +33,6 @@ def norm(s: str) -> str:
 
 def cleanup_money(txt: str):
     if not isinstance(txt, str): return None
-    # tenta formatos tipo "R$ 12,34" e similares
     m = re.search(r"(\d{1,3}(?:\.\d{3})*|\d+)[\s]*[,\.](\d{2})", txt)
     if not m: return None
     inteiro = m.group(1).replace(".", "")
@@ -129,70 +130,99 @@ def match_canonical(prod_name: str):
             return section, item["key"]
     return None, None
 
-# ------------------- Playwright: garantir Chromium + abrir URL -------------------
+# ------------------- Playwright: garantir Chromium + helpers de navegação -------------------
 def ensure_chromium_installed():
-    """Garante o browser do Playwright (idempotente/silencioso)."""
     try:
         subprocess.run(
             ["python", "-m", "playwright", "install", "chromium", "--with-deps"],
             check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
     except Exception:
-        try:
-            subprocess.run(
-                ["python", "-m", "playwright", "install", "chromium"],
-                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
-            pass
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
 
-def try_select_store(page, cep: str):
-    """Se aparecer modal de loja/CEP, tenta preencher e confirmar. Ignora erros."""
-    if not cep: return
+def click_if_visible(page, role=None, name_regex=None, css=None, timeout=1500):
     try:
-        texts = ["Selecione", "Entrega", "Retirada", "loja", "Definir", "Selecionar", "Confirmar", "Endereço"]
-        for t in texts:
-            loc = page.get_by_role("button", name=re.compile(t, re.I)).first
-            if loc and loc.is_visible():
-                loc.click()
-                page.wait_for_timeout(800)
-                break
-    except Exception:
-        pass
-    try:
-        page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep)
-    except Exception:
-        try:
-            page.locator("input[type=tel]").first.fill(cep)
-        except Exception:
-            pass
-    try:
-        page.get_by_role("button", name=re.compile("Buscar|Confirmar|Aplicar|Usar|OK|Continuar|Salvar", re.I)).first.click()
-        page.wait_for_timeout(1200)
-    except Exception:
-        pass
-    try:
-        page.get_by_role("button", name=re.compile("Selecionar|Escolher|Retirar|Usar esta loja", re.I)).first.click()
-        page.wait_for_timeout(1200)
-    except Exception:
-        pass
-
-def scroll_load(page, rounds=20):
-    for _ in range(rounds):
-        page.mouse.wheel(0, 2200)
-        page.wait_for_timeout(420)
-    # tenta “ver mais”/“carregar mais”, se existir
-    try:
-        for _ in range(5):
-            btn = page.get_by_role("button", name=re.compile("mais|ver mais|carregar", re.I)).first
+        if css:
+            el = page.locator(css)
+            if el and el.is_visible():
+                el.click(); page.wait_for_timeout(timeout); return True
+        if role and name_regex:
+            btn = page.get_by_role(role, name=re.compile(name_regex, re.I)).first
             if btn and btn.is_visible():
-                btn.click(); page.wait_for_timeout(900)
-            else:
-                break
+                btn.click(); page.wait_for_timeout(timeout); return True
+    except Exception:
+        return False
+    return False
+
+def accept_cookies(page):
+    # tenta vários botões comuns
+    for pat in ["Aceitar", "Aceito", "Concordo", "Permitir", "OK", "Prosseguir", "Continuar", "Fechar"]:
+        if click_if_visible(page, role="button", name_regex=pat): return
+        # alguns banners usam <a> como botão
+        try:
+            link = page.get_by_role("link", name=re.compile(pat, re.I)).first
+            if link and link.is_visible():
+                link.click(); page.wait_for_timeout(1000); return
+        except Exception:
+            pass
+
+def set_store_and_cep(page, host, cep):
+    """Para páginas /loja/XX: selecionar loja e setar CEP se modal aparecer."""
+    accept_cookies(page)
+    # botões típicos de “Usar/Selecionar esta loja”
+    for pat in ["Selecionar esta loja", "Usar esta loja", "Escolher esta loja", "Usar loja", "Definir loja", "Confirmar loja"]:
+        if click_if_visible(page, role="button", name_regex=pat): break
+
+    # abrir modal de endereço/CEP, se existir
+    for pat in ["Endereço", "CEP", "Entrega", "Retirada", "Definir endereço", "Alterar endereço"]:
+        if click_if_visible(page, role="button", name_regex=pat): break
+
+    # preencher CEP
+    if cep:
+        try:
+            page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep)
+            click_if_visible(page, role="button", name_regex="Buscar|Confirmar|Aplicar|Usar|OK|Continuar|Salvar")
+        except Exception:
+            try:
+                page.locator("input[type=tel]").first.fill(cep)
+                click_if_visible(page, role="button", name_regex="Buscar|Confirmar|Aplicar|Usar|OK|Continuar|Salvar")
+            except Exception:
+                pass
+
+def go_to_list_page(page, host):
+    """Se estiver em /loja/XX, pula para a página de ofertas correta por domínio."""
+    pu = urlparse(page.url)
+    if re.search(r"/loja/\d+", pu.path or ""):
+        if "centerbox" in host:
+            page.goto(f"{host}/clube", wait_until="domcontentloaded"); page.wait_for_timeout(1200)
+        elif "saoluiz" in host or "mercadinho" in host:
+            page.goto(f"{host}/ofertas", wait_until="domcontentloaded"); page.wait_for_timeout(1200)
+
+    # se ainda não for listagem, tenta links de navegação
+    if not re.search(r"oferta|clube|promo|categoria|horti|merce|busca", page.url, re.I):
+        for pat in ["Ofertas", "Clube", "Promo"]:
+            if click_if_visible(page, role="link", name_regex=pat): break
+
+def wait_prices(page):
+    """Espera preço aparecer pra garantir que carregou (VTEX)."""
+    try:
+        page.wait_for_selector('.vtex-product-price-1-x-sellingPriceValue, .best-price, meta[itemprop="price"]', timeout=12000)
     except Exception:
         pass
 
-# --------- JSON walker (acha produtos/preços em qualquer estrutura VTEX) ---------
+def scroll_and_load_more(page, rounds=22):
+    for _ in range(rounds):
+        page.mouse.wheel(0, 2400)
+        page.wait_for_timeout(360)
+    # “ver mais”
+    for _ in range(6):
+        clicked = click_if_visible(page, role="button", name_regex="mais|ver mais|carregar|see more|load more", timeout=900)
+        if not clicked: break
+
+# --------- JSON walker (VTEX/geral) ---------
 PRICE_KEYS = {"price","salePrice","bestPrice","value","finalPrice","sellingPrice","Price","SellingPrice","unitPrice"}
 NAME_KEYS  = {"name","productName","itemName","title","Name","Title","product_name","description"}
 
@@ -200,12 +230,11 @@ def walk_json_for_products(obj):
     found=[]
     try:
         if isinstance(obj, dict):
-            # VTEX padrão: items -> sellers -> commertialOffer -> Price
+            # VTEX comum: commertialOffer.Price
             if "commertialOffer" in obj and isinstance(obj["commertialOffer"], dict):
                 offer = obj["commertialOffer"]
                 raw = offer.get("Price") or offer.get("ListPrice") or offer.get("PriceWithoutDiscount")
                 if raw is not None:
-                    # tenta achar um nome próximo
                     name = obj.get("name") or obj.get("productName") or obj.get("itemName") or ""
                     if name:
                         try:
@@ -213,7 +242,6 @@ def walk_json_for_products(obj):
                             found.append({"name": str(name), "price": price})
                         except Exception:
                             pass
-            # genérico
             has_name = any(k in obj for k in NAME_KEYS)
             has_price= any(k in obj for k in PRICE_KEYS)
             if has_name and has_price:
@@ -238,36 +266,29 @@ def walk_json_for_products(obj):
 
 # ------------------- Coleta com Playwright (HTML + XHR/JSON) -------------------
 def fetch_with_browser(url: str, cep: str):
-    """
-    Abre a URL; se for /loja/XX, desvia pra /clube (Centerbox) ou /ofertas (São Luiz).
-    Tenta resolver modal por CEP. Faz scroll, captura HTML e XHR/JSON.
-    Retorna (html, itens_json).
-    """
     ensure_chromium_installed()
-    captured = []  # itens vindos de JSON da rede
+    captured = []       # itens de JSON
+    net_urls = []       # URLs de rede úteis (log)
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-zygote",
-                    "--single-process",
-                ],
+                args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage",
+                      "--disable-gpu","--no-zygote","--single-process"],
             )
             context = browser.new_context()
             page = context.new_page()
-            page.set_default_timeout(25000)
+            page.set_default_timeout(30000)
 
-            # Listener de respostas XHR/JSON (VTEX)
+            # Ouve respostas (pra extrair JSON)
             def on_response(res):
                 try:
+                    u = res.url
+                    if any(k in u for k in ["product","sku","search","shelf","pric","offer","items","simulation"]):
+                        net_urls.append(u[:220])
                     ct = (res.headers or {}).get("content-type","").lower()
-                    if "application/json" in ct or res.url.endswith(".json"):
+                    if "application/json" in ct or u.endswith(".json"):
                         data = None
                         try:
                             data = res.json()
@@ -285,153 +306,105 @@ def fetch_with_browser(url: str, cep: str):
                     pass
             page.on("response", on_response)
 
-            # 1) abre a URL original
+            # 1) Abre a URL original
             try:
                 page.goto(url, wait_until="domcontentloaded")
             except PwTimeout:
                 pass
 
-            # 2) tenta destravar por CEP (se surgir modal)
-            try_select_store(page, cep)
+            host = f"{urlparse(page.url).scheme}://{urlparse(page.url).netloc}"
 
-            # 3) se for /loja/XX, desvia pro caminho certo
-            pu = urlparse(page.url)
-            host = f"{pu.scheme}://{pu.netloc}"
-            if re.search(r"/loja/\d+", pu.path or ""):
-                if "centerbox" in host:
-                    page.goto(f"{host}/clube", wait_until="domcontentloaded")
-                elif "saoluiz" in host or "mercadinho" in host:
-                    page.goto(f"{host}/ofertas", wait_until="domcontentloaded")
-                page.wait_for_timeout(1200)
+            # 2) Aceita cookies + define loja + CEP
+            accept_cookies(page)
+            if re.search(r"/loja/\d+", urlparse(page.url).path or ""):
+                set_store_and_cep(page, host, cep)
 
-            # 4) reforço: se ainda não for listagem, tenta clicar link “Ofertas/Clube/Promo”
-            try:
-                if not re.search(r"oferta|clube|promo|categoria|horti|merce|busca", page.url, re.I):
-                    link = page.get_by_role("link", name=re.compile("Ofertas|Clube|Promo", re.I)).first
-                    if link and link.is_visible():
-                        link.click()
-                        page.wait_for_timeout(1500)
-            except Exception:
-                pass
+            # 3) Vai pra página de ofertas correta
+            go_to_list_page(page, host)
 
-            # 5) scroll + “ver mais”
-            scroll_load(page, rounds=20)
+            # 4) Espera preço aparecer e força carregamento
+            wait_prices(page)
+            scroll_and_load_more(page, rounds=22)
+
+            # 5) HTML final
             html = page.content()
+
             context.close(); browser.close()
-            return html, captured
+            return html, captured, net_urls
 
     except Exception:
-        # fallback: requests_html
+        # fallback requests_html
         try:
             from requests_html import HTMLSession
             sess = HTMLSession()
-            r = sess.get(url, timeout=30)
-            r.html.render(timeout=60, sleep=6, scrolldown=14)
-            return r.html.html, []
+            r = sess.get(url, timeout=35)
+            r.html.render(timeout=70, sleep=6, scrolldown=16)
+            return r.html.html, [], []
         except Exception:
-            return "", []
+            return "", [], []
 
-# ------------------- EXTRAÇÕES ESPECÍFICAS POR DOMÍNIO -------------------
+# ------------------- Extratores -------------------
+# Específicos
 def extract_centerbox(html: str):
-    """Extrator afinado para Centerbox (/clube)."""
     items=[]
     soup = BeautifulSoup(html or "", "lxml")
-
-    # 1) meta price + name
     for card in soup.select('[data-testid="product-summary-container"], .vtex-product-summary-2-x-container, .product-card, .shelf-item'):
         name = None; price = None
-
-        # nome
-        for sel in [
-            '[data-testid="product-name"]',
-            '.vtex-product-summary-2-x-productBrand',
-            '.product-title, .name, h3, h2, [itemprop="name"]'
-        ]:
+        for sel in ['[data-testid="product-name"]','.vtex-product-summary-2-x-productBrand','.product-title, .name, h3, h2, [itemprop="name"]']:
             el = card.select_one(sel)
             if el and el.get_text(strip=True):
                 name = el.get_text(" ", strip=True); break
         if not name:
             name = card.get_text(" ", strip=True)[:200]
-
-        # preço (vários formatos VTEX)
-        # a) span com classes de selling price
-        for sel in [
-            '.vtex-product-price-1-x-sellingPriceValue',
-            '.vtex-product-price-1-x-sellingPrice .vtex-product-price-1-x-currencyInteger',
-            '.best-price, .price, [data-price]',
-        ]:
+        for sel in ['.vtex-product-price-1-x-sellingPriceValue','.vtex-product-price-1-x-currencyInteger','.best-price, .price, [data-price]']:
             el = card.select_one(sel)
             if el:
                 price = cleanup_money(el.get_text(" ", strip=True))
                 if price is not None: break
-
-        # b) meta itemprop=price (conteúdo numérico)
         if price is None:
             meta = card.select_one('meta[itemprop="price"]')
             if meta and meta.has_attr("content"):
-                try: price = float(str(meta["content"]).replace(",", "."))
+                try: price = float(str(meta["content"]).replace(",", ".")); 
                 except Exception: pass
-
         if name and price is not None:
             items.append({"name": name[:200], "price": price})
-
     # dedup
     out, seen = [], set()
     for it in items:
         k=(it["name"], round(float(it["price"]),2))
-        if k not in seen:
-            out.append(it); seen.add(k)
+        if k not in seen: out.append(it); seen.add(k)
     return out
 
 def extract_saoluiz(html: str):
-    """Extrator afinado para Mercadinhos São Luiz (/ofertas)."""
     items=[]
     soup = BeautifulSoup(html or "", "lxml")
-
     for card in soup.select('.vtex-product-summary-2-x-container, .product-card, .shelf-item, [data-testid="product-summary-container"]'):
         name = None; price = None
-
-        # nome
-        for sel in [
-            '.vtex-product-summary-2-x-productBrand',
-            '[data-testid="product-name"]',
-            '.product-title, .name, h3, h2, [itemprop="name"]'
-        ]:
+        for sel in ['.vtex-product-summary-2-x-productBrand','[data-testid="product-name"]','.product-title, .name, h3, h2, [itemprop="name"]']:
             el = card.select_one(sel)
             if el and el.get_text(strip=True):
                 name = el.get_text(" ", strip=True); break
         if not name:
             name = card.get_text(" ", strip=True)[:200]
-
-        # preço
-        for sel in [
-            '.vtex-product-price-1-x-sellingPriceValue',
-            '.best-price, .price, [data-price]',
-            '.vtex-product-price-1-x-currencyInteger'
-        ]:
+        for sel in ['.vtex-product-price-1-x-sellingPriceValue','.best-price, .price, [data-price]','.vtex-product-price-1-x-currencyInteger']:
             el = card.select_one(sel)
             if el:
                 price = cleanup_money(el.get_text(" ", strip=True))
                 if price is not None: break
-
         if price is None:
             meta = card.select_one('meta[itemprop="price"]')
             if meta and meta.has_attr("content"):
-                try: price = float(str(meta["content"]).replace(",", "."))
+                try: price = float(str(meta["content"]).replace(",", ".")); 
                 except Exception: pass
-
         if name and price is not None:
             items.append({"name": name[:200], "price": price})
-
-    # dedup
     out, seen = [], set()
     for it in items:
         k=(it["name"], round(float(it["price"]),2))
-        if k not in seen:
-            out.append(it); seen.add(k)
+        if k not in seen: out.append(it); seen.add(k)
     return out
 
-# ------------------- EXTRAÇÃO GENÉRICA (fallback HTML) -------------------
+# Genérico
 GEN_PRICE_SEL = (
     '.vtex-product-price-1-x-sellingPriceValue, .best-price, .price, '
     '[class*="price"], [data-price], meta[itemprop="price"]'
@@ -440,7 +413,6 @@ GEN_NAME_SEL = (
     '.vtex-product-summary-2-x-productBrand, .product-title, .name, '
     'h3, h2, [itemprop="name"], [data-name]'
 )
-
 def extract_generic(html: str):
     items=[]
     soup = BeautifulSoup(html or "", "lxml")
@@ -448,33 +420,24 @@ def extract_generic(html: str):
         '.vtex-product-summary-2-x-container, .product-card, .shelf-item, '
         '.product, .card, [itemtype*="Product"], .item, [data-testid="product-summary-container"]'
     )
-    for card in cards[:1800]:
+    for card in cards[:2000]:
         name = None; price = None
         eln = card.select_one(GEN_NAME_SEL)
-        if eln and eln.get_text(strip=True):
-            name = eln.get_text(" ", strip=True)
-        else:
-            name = card.get_text(" ", strip=True)[:200]
-
-        # price de meta
+        name = eln.get_text(" ", strip=True) if (eln and eln.get_text(strip=True)) else card.get_text(" ", strip=True)[:200]
         meta = card.select_one('meta[itemprop="price"]')
         if meta and meta.has_attr("content"):
-            try: price = float(str(meta["content"]).replace(",", "."))  # prioriza meta
+            try: price = float(str(meta["content"]).replace(",", ".")) 
             except Exception: price = None
         if price is None:
             elp = card.select_one(GEN_PRICE_SEL)
             if elp:
                 price = cleanup_money(elp.get_text(" ", strip=True))
-
         if name and price is not None:
             items.append({"name": name[:200], "price": price})
-
-    # dedup
     out, seen = [], set()
     for it in items:
         k=(it["name"], round(float(it["price"]),2))
-        if k not in seen:
-            out.append(it); seen.add(k)
+        if k not in seen: out.append(it); seen.add(k)
     return out
 
 # ------------------- Comparação -------------------
@@ -494,14 +457,13 @@ if go:
     if not url1 or not url2:
         st.error("Manda os dois links 😉"); st.stop()
 
-    with st.spinner("Abrindo páginas, capturando HTML + XHR/JSON…"):
-        html1, net1 = fetch_with_browser(url1, cep)
-        html2, net2 = fetch_with_browser(url2, cep)
+    with st.spinner("Abrindo páginas, definindo loja/CEP, capturando HTML + XHR/JSON…"):
+        html1, net_items1, net_urls1 = fetch_with_browser(url1, cep)
+        html2, net_items2, net_urls2 = fetch_with_browser(url2, cep)
 
     host1 = urlparse(url1).netloc
     host2 = urlparse(url2).netloc
 
-    # Escolhe extratores específicos por domínio
     if "centerbox" in host1:
         items1 = extract_centerbox(html1)
     elif "saoluiz" in host1 or "mercadinho" in host1:
@@ -516,9 +478,8 @@ if go:
     else:
         items2 = extract_generic(html2)
 
-    # Anexa itens vindos das respostas JSON (rede)
-    items1 += net1
-    items2 += net2
+    items1 += net_items1
+    items2 += net_items2
 
     # dedup geral
     def dedup_items(items):
@@ -531,12 +492,14 @@ if go:
                 out.append({"name": it["name"], "price": float(it["price"])})
                 seen.add(k)
         return out
-
     items1 = dedup_items(items1)
     items2 = dedup_items(items2)
 
     if not items1 and not items2:
-        st.error("Ainda não consegui ler preços nessas URLs (talvez login rígido). Me manda os dois links e o CEP usado que eu ajusto mais fino.")
+        st.error("Ainda não consegui ler preços (pode ser login rígido). Tenta informar um CEP. Se persistir, me manda prints que eu cravo o seletor exato.")
+        with st.expander("🔧 Debug de rede capturado"):
+            st.write("URLs suspeitas - Supermercado #1:", net_urls1[:40])
+            st.write("URLs suspeitas - Supermercado #2:", net_urls2[:40])
         st.stop()
 
     name1 = host1.replace("www.","")
@@ -584,8 +547,10 @@ if go:
 
     st.success(f"🏆 **Vencedor:** {winner}\n\n{msg}")
 
-    with st.expander("🔎 Itens brutos (debug)"):
+    with st.expander("🔎 Itens brutos + Rede (debug)"):
         st.write(name1, len(items1)); st.write(items1[:40])
         st.write(name2, len(items2)); st.write(items2[:40])
+        st.write("URLs de rede #1:", net_urls1[:40])
+        st.write("URLs de rede #2:", net_urls2[:40])
 
-st.caption("Cole /loja/XX, /clube ou /ofertas. Se pedir loja, informe um CEP (opcional).")
+st.caption("Dica: cole /loja/XX ou diretamente /clube (Centerbox) /ofertas (São Luiz). Informe um CEP se o site pedir loja.")
