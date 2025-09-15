@@ -1,9 +1,9 @@
-# app.py — Comparador “cola o link e vai” (2 supermercados)
-# Usuário cola 2 URLs; CEP opcional pra destravar preço se houver modal de loja.
-# Playwright com auto-instalação do Chromium + flags anti-sandbox/dev-shm.
-# Fallback: requests_html (render JS leve) se o browser falhar.
+# app.py — Comparador “cole os links e pronto” (2 supermercados)
+# Novidade: captura respostas XHR/JSON pelo Playwright e extrai preços direto do JSON.
+# Continua tendo parsing do HTML e fallback com requests_html.
+# CEP é opcional: se surgir modal pedindo loja/endereço, tentamos preencher automaticamente.
 
-import os, re, unicodedata, subprocess
+import os, re, unicodedata, json, subprocess
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -17,14 +17,14 @@ st.title("🛒 Comparador de Supermercados — cole os links e pronto")
 
 c1, c2 = st.columns(2)
 with c1:
-    url1 = st.text_input("🔗 URL do Supermercado #1", placeholder="Cole aqui a página de ofertas/categoria…")
+    url1 = st.text_input("🔗 URL do Supermercado #1", placeholder="Cole a página de ofertas/categoria…")
 with c2:
-    url2 = st.text_input("🔗 URL do Supermercado #2", placeholder="Cole aqui a página de ofertas/categoria…")
+    url2 = st.text_input("🔗 URL do Supermercado #2", placeholder="Cole a página de ofertas/categoria…")
 
-cep = st.text_input("📍 CEP (opcional, ajuda a liberar preços se o site pedir loja)", placeholder="Ex.: 60000-000")
+cep = st.text_input("📍 CEP (opcional — ajuda quando o site pede loja)", placeholder="Ex.: 60000-000")
 go = st.button("Comparar")
 
-# ------------------- Helpers de texto/tamanho/marca -------------------
+# ------------------- Helpers (texto/tamanho/marca/dinheiro) -------------------
 def norm(s: str) -> str:
     s = unicodedata.normalize("NFD", str(s).lower())
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch in "xµ/.-")
@@ -150,7 +150,6 @@ def try_select_store(page, cep: str):
     """Se aparecer modal de loja/CEP, tenta preencher e confirmar. Ignora erros."""
     if not cep: return
     try:
-        # clica em botões típicos que abrem seletor
         texts = ["Selecione", "Entrega", "Retirada", "loja", "Definir", "Selecionar", "Confirmar", "Endereço"]
         for t in texts:
             loc = page.get_by_role("button", name=re.compile(t, re.I)).first
@@ -160,7 +159,6 @@ def try_select_store(page, cep: str):
                 break
     except Exception:
         pass
-    # preencher CEP
     try:
         page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep)
     except Exception:
@@ -168,30 +166,60 @@ def try_select_store(page, cep: str):
             page.locator("input[type=tel]").first.fill(cep)
         except Exception:
             pass
-    # confirmar/usar
     try:
         page.get_by_role("button", name=re.compile("Buscar|Confirmar|Aplicar|Usar|OK|Continuar|Salvar", re.I)).first.click()
         page.wait_for_timeout(1200)
     except Exception:
         pass
-    # selecionar a primeira loja se houver
     try:
         page.get_by_role("button", name=re.compile("Selecionar|Escolher|Retirar|Usar esta loja", re.I)).first.click()
         page.wait_for_timeout(1200)
     except Exception:
         pass
 
-def scroll_load(page, rounds=16):
+def scroll_load(page, rounds=18):
     for _ in range(rounds):
-        page.mouse.wheel(0, 1800)
-        page.wait_for_timeout(500)
+        page.mouse.wheel(0, 2000)
+        page.wait_for_timeout(450)
 
+# --------- JSON walker (acha produtos/preços em qualquer estrutura) ---------
+PRICE_KEYS = {"price","salePrice","bestPrice","value","finalPrice","sellingPrice","Price","SellingPrice","unitPrice"}
+NAME_KEYS  = {"name","productName","itemName","title","Name","Title","product_name","description"}
+
+def walk_json_for_products(obj):
+    found=[]
+    try:
+        if isinstance(obj, dict):
+            has_name = any(k in obj for k in NAME_KEYS)
+            has_price= any(k in obj for k in PRICE_KEYS)
+            if has_name and has_price:
+                name = next((str(obj[k]) for k in NAME_KEYS if k in obj and obj[k]), "")
+                raw  = next((obj[k] for k in PRICE_KEYS if k in obj and obj[k] is not None), None)
+                if isinstance(raw, str):
+                    price = cleanup_money(raw)
+                elif isinstance(raw, (int, float)):
+                    price = float(raw)
+                else:
+                    price = None
+                if name and price is not None:
+                    found.append({"name": name, "price": price})
+            for v in obj.values():
+                found.extend(walk_json_for_products(v))
+        elif isinstance(obj, list):
+            for x in obj:
+                found.extend(walk_json_for_products(x))
+    except Exception:
+        pass
+    return found
+
+# ------------------- Coleta com Playwright (HTML + XHR/JSON) -------------------
 def fetch_with_browser(url: str, cep: str):
     """
-    Abre a URL no Chromium headless; se aparecer modal de loja, tenta CEP;
-    rola a página e devolve o HTML final. Se falhar, usa fallback requests_html.
+    Abre a URL no Chromium headless; tenta CEP se surgir modal;
+    rola a página; devolve (html_final, itens_json_capturados).
     """
     ensure_chromium_installed()
+    captured = []  # itens vindos de JSON de rede
 
     try:
         with sync_playwright() as p:
@@ -210,15 +238,38 @@ def fetch_with_browser(url: str, cep: str):
             page = context.new_page()
             page.set_default_timeout(25000)
 
+            # Listener de respostas XHR/JSON
+            def on_response(res):
+                try:
+                    ct = (res.headers or {}).get("content-type","").lower()
+                    if "application/json" in ct or res.url.endswith(".json"):
+                        # lê o corpo e tenta decodificar
+                        try:
+                            data = res.json()
+                        except Exception:
+                            try:
+                                txt = res.text()
+                                data = json.loads(txt)
+                            except Exception:
+                                data = None
+                        if data is not None:
+                            items = walk_json_for_products(data)
+                            if items:
+                                captured.extend(items)
+                except Exception:
+                    pass
+            page.on("response", on_response)
+
+            # navega
             try:
                 page.goto(url, wait_until="domcontentloaded")
             except PwTimeout:
                 pass
 
-            # tenta destravar loja por CEP (se houver modal)
+            # tenta destravar por CEP
             try_select_store(page, cep)
 
-            # se não for listagem, tenta clicar em “Ofertas/Clube/Promoções”
+            # se não for listagem, tenta “Ofertas/Clube/Promo”
             try:
                 if not re.search(r"oferta|clube|promo|categoria|horti|merce|busca", page.url, re.I):
                     link = page.get_by_role("link", name=re.compile("Ofertas|Clube|Promo", re.I)).first
@@ -228,23 +279,24 @@ def fetch_with_browser(url: str, cep: str):
             except Exception:
                 pass
 
-            scroll_load(page, rounds=16)
+            scroll_load(page, rounds=18)
             html = page.content()
+
             context.close(); browser.close()
-            return html
+            return html, captured
 
     except Exception:
-        # fallback JS leve
+        # fallback com requests_html
         try:
             from requests_html import HTMLSession
             sess = HTMLSession()
             r = sess.get(url, timeout=30)
-            r.html.render(timeout=50, sleep=5, scrolldown=12)
-            return r.html.html
+            r.html.render(timeout=60, sleep=6, scrolldown=14)
+            return r.html.html, []
         except Exception:
-            return ""
+            return "", []
 
-# ------------------- Extração dos cards -------------------
+# ------------------- Extração dos cards HTML -------------------
 PRICE_SEL = (
     '.vtex-product-price-1-x-sellingPriceValue, '
     '.best-price, .price, [class*="price"], [data-price]'
@@ -254,14 +306,14 @@ NAME_SEL = (
     '.product-title, .name, h3, h2, [itemprop="name"], [data-name]'
 )
 
-def extract_cards(html: str):
+def extract_cards_from_html(html: str):
     items=[]
     soup=BeautifulSoup(html or "", "lxml")
     cards = soup.select(
         '.vtex-product-summary-2-x-container, .product-card, .shelf-item, '
         '.product, .card, [itemtype*="Product"], .item'
     )
-    for c in cards[:1200]:
+    for c in cards[:1500]:
         # preço
         price_txt = None
         for el in c.select(PRICE_SEL):
@@ -293,9 +345,8 @@ def extract_cards(html: str):
 def map_prices(items):
     mapped={}
     for it in items:
-        # mapeia pro catálogo (pega o menor preço por item)
         sec,key = match_canonical(it["name"])
-        if not sec: 
+        if not sec:
             continue
         price = it["price"]
         cur = mapped.get((sec,key))
@@ -307,15 +358,34 @@ if go:
     if not url1 or not url2:
         st.error("Manda os dois links 😉"); st.stop()
 
-    with st.spinner("Abrindo as páginas e coletando os preços…"):
-        html1 = fetch_with_browser(url1, cep)
-        html2 = fetch_with_browser(url2, cep)
+    with st.spinner("Abrindo as páginas e coletando os preços (HTML + XHR)…"):
+        html1, net1 = fetch_with_browser(url1, cep)
+        html2, net2 = fetch_with_browser(url2, cep)
 
-    items1 = extract_cards(html1)
-    items2 = extract_cards(html2)
+    items1 = extract_cards_from_html(html1)
+    items2 = extract_cards_from_html(html2)
+
+    # junta itens vindos do JSON (rede)
+    items1 += net1
+    items2 += net2
+
+    # dedup geral
+    def dedup_items(items):
+        out, seen = [], set()
+        for it in items:
+            if not it.get("name") or not isinstance(it.get("price"), (int,float)): 
+                continue
+            k = (it["name"], round(float(it["price"]), 2))
+            if k not in seen:
+                out.append({"name": it["name"], "price": float(it["price"])})
+                seen.add(k)
+        return out
+
+    items1 = dedup_items(items1)
+    items2 = dedup_items(items2)
 
     if not items1 and not items2:
-        st.error("Não consegui ler preços nessas URLs (pode exigir login rígido ou o HTML mudou). Me mande os links que ajusto os seletores.")
+        st.error("Não consegui ler preços nessas URLs (pode exigir login rígido ou o HTML/JSON mudou). Me envie os links exatos que eu ajusto os seletores.")
         st.stop()
 
     name1 = urlparse(url1).netloc.replace("www.","")
@@ -367,4 +437,4 @@ if go:
         st.write(name1, len(items1)); st.write(items1[:30])
         st.write(name2, len(items2)); st.write(items2[:30])
 
-st.caption("Dica: cole links de **listagem** (Ofertas/Categoria). Se o site abrir modal de loja, informe um **CEP** (opcional) e eu tento resolver sozinho.")
+st.caption("Cole links de **listagem** (Ofertas/Categoria). Se pedir loja, informe um **CEP** — eu tento sozinho. Persistindo erro, me envie os links exatos que eu ajusto os seletores.")
