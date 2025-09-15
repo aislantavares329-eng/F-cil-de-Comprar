@@ -1,40 +1,130 @@
-# app.py — Comparador de Encartes (PDF/JPG) por supermercado
-# v4 — sem inputs de nome; detecção automática de mercado; amostra PT-BR; matching mais “grudento”
+# app.py — Comparador de Encartes (PDF/JPG) com OCR automático
+# v6 — instala OCR se faltar (easyocr/torch ou pytesseract + tesseract-ocr),
+#       detecta mercado, amostra PT-BR (3 colunas), matching tolerante.
 
-import sys, subprocess, importlib, io, re, unicodedata
+import sys, subprocess, importlib, io, os, re, unicodedata, shutil, platform
 from pathlib import Path
 
-# ---------- deps básicos ----------
-REQS = [
+# ======================= Bootstrap de dependências =======================
+BASE_REQS = [
     ("streamlit","streamlit>=1.34"),
     ("pandas","pandas>=2.0"),
     ("numpy","numpy>=1.26"),
     ("Pillow","Pillow>=10.0"),
     ("pymupdf","pymupdf>=1.23"),     # fitz
-    ("rapidfuzz","rapidfuzz>=3.0"),  # fuzzy p/ agrupar nomes
+    ("rapidfuzz","rapidfuzz>=3.0"),  # fuzzy
 ]
-def _pip(spec):
-    try: subprocess.check_call([sys.executable,"-m","pip","install","--quiet",spec])
-    except Exception: pass
-for m,s in REQS:
-    try: importlib.import_module(m)
-    except Exception: _pip(s)
+def pip_quiet(spec):
+    try:
+        subprocess.check_call([sys.executable,"-m","pip","install","--quiet",spec])
+        return True
+    except Exception:
+        return False
+
+for mod,spec in BASE_REQS:
+    try: importlib.import_module(mod)
+    except Exception: pip_quiet(spec)
 
 import streamlit as st, pandas as pd, numpy as np
 from PIL import Image
 import fitz
 from rapidfuzz import fuzz
 
-# OCR (opcional)
-HAS_TESS = HAS_EASYOCR = False
-try:
-    import pytesseract; HAS_TESS=True
-except Exception: pass
-try:
-    import easyocr;   HAS_EASYOCR=True
-except Exception: pass
+# ======================= OCR auto-instala =======================
+HAS_TESS = False          # pytesseract lib OK
+HAS_TESS_BIN = False      # binário tesseract instalado
+HAS_EASYOCR = False       # easyocr OK
 
-# ---------- helpers ----------
+def ensure_easyocr():
+    global HAS_EASYOCR
+    try:
+        import easyocr  # noqa
+        HAS_EASYOCR = True
+        return True
+    except Exception:
+        pass
+    # tenta instalar easyocr (puxa torch)
+    ok = pip_quiet("easyocr>=1.7.1")
+    if ok:
+        try:
+            import easyocr  # noqa
+            HAS_EASYOCR = True
+            return True
+        except Exception:
+            return False
+    return False
+
+def ensure_pytesseract_and_binary():
+    """Garante pytesseract e tenta instalar o binário tesseract-ocr conforme SO."""
+    global HAS_TESS, HAS_TESS_BIN
+    # lib python
+    try:
+        import pytesseract  # noqa
+        HAS_TESS = True
+    except Exception:
+        if pip_quiet("pytesseract>=0.3.10"):
+            try:
+                import pytesseract  # noqa
+                HAS_TESS = True
+            except Exception:
+                HAS_TESS = False
+    # binário
+    HAS_TESS_BIN = bool(shutil.which("tesseract"))
+    if not HAS_TESS_BIN:
+        try:
+            os_name = platform.system().lower()
+            if "linux" in os_name:
+                subprocess.run(["bash","-lc","sudo apt-get update -y && sudo apt-get install -y tesseract-ocr"], check=False)
+            elif "darwin" in os_name:  # macOS
+                subprocess.run(["bash","-lc","brew install tesseract"], check=False)
+            elif "windows" in os_name:
+                # requer choco
+                subprocess.run(["powershell","-Command","choco install tesseract -y"], check=False)
+        except Exception:
+            pass
+    HAS_TESS_BIN = bool(shutil.which("tesseract"))
+    return HAS_TESS and HAS_TESS_BIN
+
+def ensure_ocr_automatically():
+    """
+    Estratégia:
+      1) easyocr (100% Python) — se instalar, já resolve OCR sem binário.
+      2) senão, pytesseract + tentar instalar tesseract-ocr por SO.
+    """
+    ok_easy = ensure_easyocr()
+    if ok_easy:
+        st.toast("✅ OCR pronto (easyocr).", icon="✅")
+        return
+    ok_tess = ensure_pytesseract_and_binary()
+    if ok_tess:
+        st.toast("✅ OCR pronto (pytesseract + tesseract).", icon="✅")
+        return
+    # fallback: pode estar sem permissão pra instalar binários
+    if HAS_TESS and not HAS_TESS_BIN:
+        st.warning("pytesseract instalado, mas o binário 'tesseract-ocr' não foi encontrado. "
+                   "Se seu ambiente bloquear apt/brew/choco, instale manualmente.")
+    else:
+        st.warning("Não consegui instalar OCR automaticamente. Vou tentar extrair texto do PDF sem OCR.")
+
+# roda a preparação de OCR ao iniciar
+ensure_ocr_automatically()
+
+# tenta carregar OCR libs (depois do bootstrap)
+try:
+    import easyocr
+    HAS_EASYOCR = True
+except Exception:
+    HAS_EASYOCR = False
+
+try:
+    import pytesseract
+    HAS_TESS = True
+    HAS_TESS_BIN = bool(shutil.which("tesseract"))
+except Exception:
+    HAS_TESS = False
+    HAS_TESS_BIN = False
+
+# ======================= Helpers gerais =======================
 def norm_txt(s:str)->str:
     s = unicodedata.normalize("NFD", s or "").lower()
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch in "-_/.,+")
@@ -46,7 +136,7 @@ SIZE_RE  = re.compile(r"(?:(\d{1,3})\s*[xX]\s*)?(\d+(?:[\.,]\d+)?)\s*(kg|g|l|ml)
 STOP = {
     "kg","un","unidade","unidades","lt","l","ml","g","gr","gramas","litro","litros",
     "cada","pacote","bandeja","caixa","garrafa","lata","sachê","sache","pct","pcte",
-    "ou","e","de","da","do","dos","das","para","pronta","pronto","congelado","resfriado",
+    "ou","e","de","da","do","dos","das","para","congelado","resfriado",
     "tipo","sabores","varios","vários","promo","promoção","promocao","oferta","ofertas",
     "clube","economia","leve","pague","leve2","pague1","rs","r$"
 }
@@ -54,15 +144,11 @@ STOP = {
 KNOWN_STORES = [
     "frangolandia","frangolândia","mix mateus","mateus","centerbox",
     "são luiz","sao luiz","carrefour","assai","atacadão","atacadao",
-    "super lagoa","pao de acucar","pão de açúcar","guanabara","bh supermercados",
-    "fort atacadista","dia","extra","angeloni","mundial","big","macro","comper"
 ]
 NORMALIZE_STORE = {
     "frangolândia":"frangolandia",
-    "frangolandia":"frangolandia",
-    "mix mateus":"mix mateus",
     "mateus":"mix mateus",
-    "são luiz":"sao luiz","sao luiz":"sao luiz"
+    "são luiz":"sao luiz",
 }
 
 def to_price(s:str):
@@ -75,42 +161,33 @@ def to_price(s:str):
         return v if 0 < v < 100000 else None
     except: return None
 
-def parse_size(txt:str):
-    txt = norm_txt(txt)
-    g=ml=None
-    for m in SIZE_RE.finditer(txt):
-        mult = int(m.group(1)) if m.group(1) else 1
-        val  = float(m.group(2).replace(",","."))
-        unit = m.group(3).lower()
-        if unit=="kg": g  = max(g or 0, val*1000*mult)
-        elif unit=="g": g = max(g or 0, val*mult)
-        elif unit=="l": ml = max(ml or 0, val*1000*mult)
-        elif unit=="ml": ml = max(ml or 0, val*mult)
-    return g, ml
-
 def canonical(raw:str):
     n = norm_txt(raw)
     n = re.sub(PRICE_RE," ",n)
     n = " ".join(w for w in n.split() if w not in STOP and not w.isdigit())
     return n.strip(" -._")
 
-def similar(a,b,th=86):  # mais grudado que antes
+def similar(a,b,th=82):
     return fuzz.token_set_ratio(a,b) >= th
 
-# ---------- leitura/OCR ----------
+# ======================= Leitura / OCR =======================
 def ocr_image(img:Image.Image)->str:
-    if HAS_TESS:
-        try: return pytesseract.image_to_string(img, lang="por")
-        except Exception: pass
+    # prioridade: easyocr (não exige binário externo)
     if HAS_EASYOCR:
         try:
             reader = easyocr.Reader(["pt"], gpu=False)
             return "\n".join(reader.readtext(np.array(img), detail=0))
-        except Exception: pass
+        except Exception:
+            pass
+    if HAS_TESS and HAS_TESS_BIN:
+        try:
+            return pytesseract.image_to_string(img, lang="por")
+        except Exception:
+            pass
     return ""
 
 def pdf_text_and_header(bts:bytes):
-    """retorna (texto_total, spans_header[(texto, size)])"""
+    """Retorna (texto_total, spans_header[(texto, size)]) e faz OCR automático se a página estiver 'muda'."""
     parts=[]; spans=[]
     with fitz.open(stream=bts, filetype="pdf") as doc:
         for i,pg in enumerate(doc):
@@ -125,8 +202,7 @@ def pdf_text_and_header(bts:bytes):
                         if i==0 and len(s)<=42 and not any(ch.isdigit() for ch in s):
                             spans.append((s, sp.get("size",0)))
             raw = "\n".join(page).strip()
-            if not raw:
-                # OCR se a página estiver “muda”
+            if len(raw) < 20:  # página sem texto — faz OCR
                 pix = pg.get_pixmap(dpi=230)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 raw = ocr_image(img)
@@ -140,12 +216,18 @@ def image_text_and_header(bts:bytes):
     header = [(ln, 32) for ln in lines if ln and not any(ch.isdigit() for ch in ln)]
     return t, header
 
-# ---------- detecta mercado ----------
+# ======================= Detecta supermercado =======================
 def detect_market(text:str, header_spans:list, filename:str):
-    # 1) spans grandes da 1ª página
+    nfull = norm_txt(text)
+    # atalhos robustos para seus encartes:
+    if "frangoland" in nfull:
+        return "frangolandia"
+    if ("mix" in nfull and "mateus" in nfull) or "mix mateus" in nfull:
+        return "mix mateus"
+
+    # spans grandes da 1ª página + fuzzy com lista conhecida
     spans = sorted([(s,sz) for s,sz in header_spans if sz>=20], key=lambda x:-x[1])[:30]
     cands = [s for s,_ in spans] + text.splitlines()[:120]
-
     for s in cands:
         n = norm_txt(s)
         best=None; score=0
@@ -155,19 +237,10 @@ def detect_market(text:str, header_spans:list, filename:str):
         if score>=80:
             return NORMALIZE_STORE.get(best, best)
 
-    # 2) heurística: curto, sem números, “maiúsculão”
-    for s,_ in spans[:10]:
-        raw=s.strip()
-        if 3<=len(raw)<=40 and not any(ch.isdigit() for ch in raw):
-            up = sum(1 for c in raw if c.isalpha() and c==c.upper())
-            tot= sum(1 for c in raw if c.isalpha())
-            if tot and (up/tot)>0.6:
-                return norm_txt(raw)
-
-    # 3) fallback: nome do arquivo
+    # fallback: nome do arquivo
     return norm_txt(Path(filename).stem.replace("_"," ").replace("-"," "))
 
-# ---------- parser de itens ----------
+# ======================= Parsing de itens =======================
 def parse_items(text:str):
     out=[]
     if not text: return out
@@ -185,11 +258,10 @@ def parse_items(text:str):
             if len(name)<3:
                 name = re.sub(PRICE_RE," ",ln).strip(" -._")
             ncan = canonical(name)
-            if len(ncan) < 4:  # lixo tipo "r", "100g"
+            if len(ncan) < 4:
                 continue
-            g,ml = parse_size(name)
-            only_size = (len(ncan.replace("g","").replace("ml",""))<3) and (g or ml)
-            if only_size: 
+            # descarta nomes que são só tamanho (ex.: "100g 100g")
+            if re.fullmatch(r"(?:\d+(?:g|ml)\s*){1,3}", ncan):
                 continue
             out.append({"name_raw":name, "price":float(price)})
     # dedup
@@ -202,11 +274,10 @@ def parse_items(text:str):
 
 def build_key(raw:str):
     base = canonical(raw)
-    # tira repetição tipo "100g 100g" dentro do base
     base = re.sub(r"\b(\d+g|ml)\b(?:\s+\1\b)+","\\1",base)
     return base or raw
 
-def unify(rows, th=84):
+def unify(rows, th=80):
     keys=list({r["key"] for r in rows})
     roots=[]; mapping={}
     for k in keys:
@@ -219,7 +290,7 @@ def unify(rows, th=84):
             mapping[k]=found
     return mapping
 
-# ---------- comparação ----------
+# ======================= Comparação =======================
 def compare(all_rows):
     markets = sorted({r["market"] for r in all_rows})
     prods   = sorted({r["key_root"] for r in all_rows})
@@ -248,15 +319,14 @@ def compare(all_rows):
     champ=max(score.items(), key=lambda kv:kv[1])[0] if score else None
     return df, score, champ
 
-# ---------- UI ----------
+# ======================= UI =======================
 st.set_page_config(page_title="Comparador de Encartes", layout="wide")
 st.title("🧾🛒 Comparador de Encartes — quem tem mais preços menores?")
 
 uploads = st.file_uploader(
-    "Envie **2 ou mais** encartes (PDF/JPG/PNG). O nome do supermercado é detectado automaticamente.",
+    "Envie **2 ou mais** encartes (PDF/JPG/PNG). O app reconhece o supermercado automaticamente.",
     type=["pdf","jpg","jpeg","png"], accept_multiple_files=True
 )
-force_ocr = st.checkbox("Forçar OCR quando o PDF estiver sem texto (mais lento)", value=False)
 
 if uploads and st.button("Comparar preços"):
     all_rows=[]; mercados_detectados=[]
@@ -266,9 +336,6 @@ if uploads and st.button("Comparar preços"):
             ext = Path(f.name).suffix.lower()
             if ext==".pdf":
                 text, header = pdf_text_and_header(data)
-                if force_ocr and len(text.strip())<40:
-                    # tenta mais uma vez com OCR
-                    text, header = pdf_text_and_header(data)
             else:
                 text, header = image_text_and_header(data)
 
@@ -282,30 +349,30 @@ if uploads and st.button("Comparar preços"):
                 key = build_key(it["name_raw"])
                 rows.append({"market":market,"key":key,"name_raw":it["name_raw"],"price":it["price"]})
             # unificação DENTRO do encarte
-            mp = unify(rows, th=86)
+            mp = unify(rows, th=82)
             for r in rows: r["key_root"]=mp[r["key"]]
             all_rows.extend(rows)
 
     if not all_rows:
-        st.error("Não encontrei preços. Se forem imagens escaneadas, marque 'Forçar OCR'.")
+        st.error("Não encontrei preços. Se os PDFs forem só-imagem e a instalação automática falhou, rode com internet ou habilite permissões para instalar OCR.")
         st.stop()
 
-    # unificação ENTRE encartes (mais permissiva pra casar nomes diferentes)
-    cross = unify(all_rows, th=80)
+    # unificação ENTRE encartes
+    cross = unify(all_rows, th=78)
     for r in all_rows: r["key_root"]=cross[r["key_root"]]
 
-    # ---- Mostra mercados detectados
+    # ---- Mercados detectados
     st.subheader("Mercados detectados")
     st.markdown("\n".join(mercados_detectados))
 
-    # ---- Amostra enxuta (PT-BR)
+    # ---- Amostra enxuta (PT-BR — APENAS 3 COLUNAS)
     df_all=pd.DataFrame(all_rows)
     amostra = df_all.rename(columns={"market":"Supermercado","name_raw":"Produto","price":"Preço"})[
         ["Supermercado","Produto","Preço"]
     ].copy()
     amostra["Preço"]=amostra["Preço"].map(lambda v: f"R$ {float(v):.2f}")
     st.subheader("Amostra de itens detectados")
-    st.dataframe(amostra.head(60), use_container_width=True)
+    st.dataframe(amostra.head(80), use_container_width=True)
 
     # ---- Comparação
     comp, placar, vencedor = compare(all_rows)
@@ -332,7 +399,7 @@ if uploads and st.button("Comparar preços"):
         ws=r["Vencedor(es)"]
         if not ws: continue
         cols=[c for c in comp.columns if c not in ("Produto","Vencedor(es)")]
-        mn = np.nanmin([r[c] for c in cols if pd.notna(r[c])])
+        mn = np.nanmin([r[c] for r in [r] for c in cols if pd.notna(r[c])])  # robusto
         linhas.append({"Produto":r["Produto"],"Menor preço":f"R$ {mn:.2f}","Supermercado(s)":", ".join(ws)})
     st.dataframe(pd.DataFrame(linhas), use_container_width=True)
 
