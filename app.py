@@ -1,7 +1,9 @@
 # app.py — Comparador “cole os links e pronto” (2 supermercados)
-# Novidade: captura respostas XHR/JSON pelo Playwright e extrai preços direto do JSON.
-# Continua tendo parsing do HTML e fallback com requests_html.
-# CEP é opcional: se surgir modal pedindo loja/endereço, tentamos preencher automaticamente.
+# - Aceita URLs /loja/XX (salta automaticamente para /clube ou /ofertas).
+# - CEP opcional para destravar preço quando houver modal de loja/endereço.
+# - Playwright com auto-instalação do Chromium + flags anti-sandbox/dev-shm.
+# - Captura HTML e também XHR/JSON (muito resiliente a mudanças de CSS).
+# - Fallback: requests_html (render JS leve) se o browser falhar.
 
 import os, re, unicodedata, json, subprocess
 from urllib.parse import urlparse
@@ -17,9 +19,9 @@ st.title("🛒 Comparador de Supermercados — cole os links e pronto")
 
 c1, c2 = st.columns(2)
 with c1:
-    url1 = st.text_input("🔗 URL do Supermercado #1", placeholder="Cole a página de ofertas/categoria…")
+    url1 = st.text_input("🔗 URL do Supermercado #1", placeholder="Ex.: https://loja.centerbox.com.br/loja/58 ou página de ofertas…")
 with c2:
-    url2 = st.text_input("🔗 URL do Supermercado #2", placeholder="Cole a página de ofertas/categoria…")
+    url2 = st.text_input("🔗 URL do Supermercado #2", placeholder="Ex.: https://mercadinhossaoluiz.com.br/loja/355 ou página de ofertas…")
 
 cep = st.text_input("📍 CEP (opcional — ajuda quando o site pede loja)", placeholder="Ex.: 60000-000")
 go = st.button("Comparar")
@@ -216,10 +218,11 @@ def walk_json_for_products(obj):
 def fetch_with_browser(url: str, cep: str):
     """
     Abre a URL no Chromium headless; tenta CEP se surgir modal;
+    se for /loja/XX, desvia para /clube (Centerbox) ou /ofertas (São Luiz);
     rola a página; devolve (html_final, itens_json_capturados).
     """
     ensure_chromium_installed()
-    captured = []  # itens vindos de JSON de rede
+    captured = []  # itens vindos de JSON da rede
 
     try:
         with sync_playwright() as p:
@@ -243,7 +246,6 @@ def fetch_with_browser(url: str, cep: str):
                 try:
                     ct = (res.headers or {}).get("content-type","").lower()
                     if "application/json" in ct or res.url.endswith(".json"):
-                        # lê o corpo e tenta decodificar
                         try:
                             data = res.json()
                         except Exception:
@@ -260,16 +262,28 @@ def fetch_with_browser(url: str, cep: str):
                     pass
             page.on("response", on_response)
 
-            # navega
+            # 1) abre a URL original
             try:
                 page.goto(url, wait_until="domcontentloaded")
             except PwTimeout:
                 pass
 
-            # tenta destravar por CEP
+            # 2) tenta destravar por CEP, se houver modal
             try_select_store(page, cep)
 
-            # se não for listagem, tenta “Ofertas/Clube/Promo”
+            # 3) se for /loja/XX, desvia para ofertas/clube
+            from urllib.parse import urlparse as _u
+            pu = _u(page.url)
+            host = f"{pu.scheme}://{pu.netloc}"
+            path = pu.path or "/"
+            if re.search(r"/loja/\d+", path):
+                if "centerbox" in host:
+                    page.goto(f"{host}/clube", wait_until="domcontentloaded")
+                elif "saoluiz" in host or "mercadinho" in host:
+                    page.goto(f"{host}/ofertas", wait_until="domcontentloaded")
+                page.wait_for_timeout(1200)
+
+            # 4) se ainda não for listagem, tenta link “Ofertas/Clube/Promo”
             try:
                 if not re.search(r"oferta|clube|promo|categoria|horti|merce|busca", page.url, re.I):
                     link = page.get_by_role("link", name=re.compile("Ofertas|Clube|Promo", re.I)).first
@@ -279,9 +293,10 @@ def fetch_with_browser(url: str, cep: str):
             except Exception:
                 pass
 
+            # 5) scroll pra carregar os cards
             scroll_load(page, rounds=18)
-            html = page.content()
 
+            html = page.content()
             context.close(); browser.close()
             return html, captured
 
@@ -362,12 +377,8 @@ if go:
         html1, net1 = fetch_with_browser(url1, cep)
         html2, net2 = fetch_with_browser(url2, cep)
 
-    items1 = extract_cards_from_html(html1)
-    items2 = extract_cards_from_html(html2)
-
-    # junta itens vindos do JSON (rede)
-    items1 += net1
-    items2 += net2
+    items1 = extract_cards_from_html(html1) + net1
+    items2 = extract_cards_from_html(html2) + net2
 
     # dedup geral
     def dedup_items(items):
@@ -437,4 +448,4 @@ if go:
         st.write(name1, len(items1)); st.write(items1[:30])
         st.write(name2, len(items2)); st.write(items2[:30])
 
-st.caption("Cole links de **listagem** (Ofertas/Categoria). Se pedir loja, informe um **CEP** — eu tento sozinho. Persistindo erro, me envie os links exatos que eu ajusto os seletores.")
+st.caption("Cole links de **listagem** ou mesmo **/loja/XX** — eu pulo para /clube (Centerbox) ou /ofertas (São Luiz). Se pedir loja, informe um **CEP** (opcional).")
