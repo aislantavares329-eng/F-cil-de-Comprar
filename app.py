@@ -1,8 +1,8 @@
-# app.py — Comparador de preços “plug-and-play”
-# • Auto-instala dependências na 1ª execução (pip + playwright + chromium)
-# • Desbloqueia loja/CEP (Centerbox: CEP + "CLIQUE E RETIRE") e abre /clube ou /ofertas
-# • Lê preços de HTML, XHR/JSON VTEX e JSON embutido; fallback /busca?ft=…
-# • Mostra tabela por seção e decide vencedor
+# app.py — Comparador "busca direta" (robusto)
+# - Sem passos manuais: instala libs e Chromium se faltar
+# - Abre cada site, aceita cookies, define CEP/loja (Centerbox: "CLIQUE E RETIRE")
+# - Para CADA produto do catálogo, abre /busca?ft=... e pega o 1º card que casa
+# - Mostra tabela por seção e decide o vencedor
 
 import sys, subprocess, importlib, re, json, unicodedata, urllib.parse
 from urllib.parse import urlparse
@@ -15,85 +15,43 @@ NEEDED = [
     ("bs4", "beautifulsoup4>=4.12"),
     ("lxml", "lxml>=5.2"),
     ("playwright", "playwright>=1.45"),
-    ("requests_html", "requests-html==0.10.0"),  # fallback p/ JS
 ]
 
-def pip_install(pkg):
+def pip_install(spec):
     try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pkg])
-        return True
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", spec])
     except Exception:
-        return False
+        pass
 
-def ensure_modules():
-    missing = []
-    for mod, spec in NEEDED:
-        try:
-            importlib.import_module(mod)
-        except Exception:
-            missing.append(spec)
-    if missing:
-        for spec in missing:
-            pip_install(spec)
+for mod, spec in NEEDED:
+    try: importlib.import_module(mod)
+    except Exception: pip_install(spec)
+
+import streamlit as st, pandas as pd
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 def ensure_chromium():
-    # baixa o runtime do Chromium p/ playwright (silencioso)
     try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        subprocess.run([sys.executable,"-m","playwright","install","chromium","--with-deps"],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        subprocess.run([sys.executable,"-m","playwright","install","chromium"],
+                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# faz o bootstrap apenas 1x por sessão
-ensure_modules()
-try:
-    import streamlit as st
-    import pandas as pd
-    from bs4 import BeautifulSoup
-    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
-except Exception:
-    # última tentativa
-    ensure_modules()
-    import streamlit as st
-    import pandas as pd
-    from bs4 import BeautifulSoup
-    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
-
-if "boot_done" not in st.session_state:
-    with st.spinner("Preparando o ambiente (1ª vez demora um pouquinho)…"):
+if "chrom_ok" not in st.session_state:
+    with st.spinner("Preparando ambiente (1ª vez pode demorar)…"):
         ensure_chromium()
-    st.session_state["boot_done"] = True
+    st.session_state["chrom_ok"] = True
 
-# ------------------- UI -------------------
-st.set_page_config(page_title="Comparador de Supermercados", layout="wide")
-st.title("🛒 Comparador — cole os links e, se precisar, um CEP")
-
-c1, c2 = st.columns(2)
-with c1:
-    url1 = st.text_input("🔗 URL do Supermercado #1", "")
-with c2:
-    url2 = st.text_input("🔗 URL do Supermercado #2", "")
-
-cep = st.text_input("📍 CEP (opcional — alguns sites só liberam preços após definir loja)", "")
-go = st.button("Comparar")
-
-# ------------------- Helpers de parsing -------------------
-def norm(s: str) -> str:
+# -------------------- Helpers de texto/tamanho --------------------
+def norm(s:str)->str:
     s = unicodedata.normalize("NFD", str(s).lower())
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch in "xµ/.-")
     return " ".join(s.split())
 
-def money(txt: str):
-    if not isinstance(txt, str): return None
+def money(txt:str):
+    if not isinstance(txt,str): return None
     m = re.search(r"(\d{1,3}(?:\.\d{3})*|\d+)\s*[,\.](\d{2})", txt)
     if not m: return None
     return float(f"{m.group(1).replace('.','')}.{m.group(2)}")
@@ -103,17 +61,17 @@ BRAND_ALIASES = {
     "omo":"omo","ype":"ype","ypê":"ype","veja":"veja","pinho":"pinho sol","pinho sol":"pinho sol",
     "downy":"downy","comfort":"comfort",
 }
-def brands_in(text_norm):
+def brands_in(n:str):
     b=set()
-    if "pinho sol" in text_norm: b.add("pinho sol")
+    if "pinho sol" in n: b.add("pinho sol")
     for k in BRAND_ALIASES:
-        if k!="pinho sol" and k in text_norm: b.add(BRAND_ALIASES[k])
+        if k!="pinho sol" and k in n: b.add(BRAND_ALIASES[k])
     return b
 
 SIZE_RE = re.compile(r"(?:(\d{1,3})\s*[xX]\s*)?(\d+(?:[\.,]\d+)?)\s*(kg|g|l|ml)\b")
-def parse_size(text_norm):
+def parse_size(n:str):
     g=ml=None
-    for m in SIZE_RE.finditer(text_norm):
+    for m in SIZE_RE.finditer(n):
         mult=int(m.group(1)) if m.group(1) else 1
         v=float(m.group(2).replace(",",".")); u=m.group(3)
         if u=="kg": g=max(g or 0, v*1000*mult)
@@ -122,9 +80,9 @@ def parse_size(text_norm):
         elif u=="ml": ml=max(ml or 0, v*mult)
     return g, ml
 
-def approx(val, tgt, tol): return (val is not None) and (tgt-tol)<=val<=(tgt+tol)
+def approx(val,tgt,tol): return (val is not None) and (tgt-tol)<=val<=(tgt+tol)
 
-# ------------------- Catálogo (seções) -------------------
+# -------------------- Catálogo (seções) --------------------
 CATALOG = {
     "ALIMENTOS":[
         {"key":"Arroz 5 kg","must":["arroz"],"size_g":5000,"tol_g":600,"q":"arroz 5kg"},
@@ -160,7 +118,7 @@ CATALOG = {
 }
 
 def tokens_ok(n, must): return all(t in n for t in (must or []))
-def alt_ok(n, alt_any): 
+def alt_ok(n, alt_any):
     if not alt_any: return True
     return any(all(t in n for t in grp) for grp in alt_any)
 def brand_ok(n, brand_any):
@@ -175,17 +133,19 @@ def size_ok(n, g=None,tg=None, ml=None,tml=None, perkg=False):
     return True
 
 def match_key(name):
-    n=norm(name)
+    n = norm(name)
     for section, items in CATALOG.items():
         for it in items:
             if not tokens_ok(n, it.get("must")): continue
             if not alt_ok(n, it.get("alt_any")): continue
             if not brand_ok(n, it.get("brand_any")): continue
-            if not size_ok(n, it.get("size_g"), it.get("tol_g"), it.get("size_ml"), it.get("tol_ml"), it.get("perkg",False)): continue
+            if not size_ok(n, it.get("size_g"), it.get("tol_g"),
+                          it.get("size_ml"), it.get("tol_ml"),
+                          it.get("perkg", False)): continue
             return section, it["key"]
     return None, None
 
-# ------------------- Playwright flow -------------------
+# -------------------- Scraping: abrir site, definir CEP, BUSCAR item --------------------
 def click_if(page, role=None, name_regex=None, css=None, t=900):
     try:
         if css:
@@ -198,104 +158,33 @@ def click_if(page, role=None, name_regex=None, css=None, t=900):
         return False
     return False
 
-def set_store_and_cep(page, cep, host=None):
+def set_store_and_cep(page, cep, host):
     # cookies
     for pat in ["Aceitar","Aceito","Concordo","Permitir","OK","Prosseguir","Continuar","Fechar"]:
         click_if(page, role="button", name_regex=pat, t=600)
-
-    # abre modal (pin / método)
+    # abrir modal
     click_if(page, role="button", name_regex="Selecion(e|ar).+método|Entrega|Retirada|loja", t=600)
-
     # CEP
     if cep:
         ok=False
         for css in ['input[placeholder*="CEP"]','input[placeholder*="cep"]','input[type="tel"]','input[name*="cep"]']:
             try:
                 el=page.locator(css).first
-                if el and el.is_visible():
-                    el.fill(cep); page.wait_for_timeout(400); ok=True; break
+                if el and el.is_visible(): el.fill(cep); page.wait_for_timeout(400); ok=True; break
             except Exception: pass
         if not ok:
             try: page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep); page.wait_for_timeout(400)
             except Exception: pass
-
-    # Centerbox: clique e retire (ou entrega)
-    if "centerbox" in (host or ""):
+    # Centerbox → “CLIQUE E RETIRE” (ou entrega)
+    if "centerbox" in host:
         clicked = click_if(page, role="button", name_regex=r"CLIQUE\s*E\s*RETIRE|Retirar|Retire", t=900)
-        if not clicked:
-            click_if(page, role="button", name_regex=r"RECEBA\s*EM\s*CASA|Entrega", t=900)
-    else:
-        click_if(page, role="button", name_regex="Confirmar|Aplicar|Continuar|OK|Usar|Salvar", t=800)
-
+        if not clicked: click_if(page, role="button", name_regex=r"RECEBA\s*EM\s*CASA|Entrega", t=900)
     # escolher 1ª loja se lista aparecer
     for pat in ["Selecionar esta loja","Usar esta loja","Selecionar","Usar loja","Escolher esta loja","Usar unidade"]:
         if click_if(page, role="button", name_regex=pat, t=900): break
-
-    # confirmar se houver outro passo
+    # confirmar
     for pat in ["Confirmar","Aplicar","Continuar","Salvar","OK"]:
         if click_if(page, role="button", name_regex=pat, t=800): break
-
-    # garantir listagem
-    if host:
-        pu = urlparse(page.url)
-        if re.search(r"/loja/\d+", pu.path or ""):
-            if "centerbox" in host:
-                page.goto(f"{host}/clube", wait_until="domcontentloaded"); page.wait_for_timeout(900)
-            elif "saoluiz" in host or "mercadinho" in host:
-                page.goto(f"{host}/ofertas", wait_until="domcontentloaded"); page.wait_for_timeout(900)
-
-def wait_prices(page):
-    try:
-        page.wait_for_selector('.vtex-product-price-1-x-sellingPriceValue, .best-price, meta[itemprop="price"]', timeout=12000)
-    except Exception:
-        pass
-
-def scroll_more(page, rounds=18):
-    for _ in range(rounds):
-        page.mouse.wheel(0, 2200); page.wait_for_timeout(320)
-    for _ in range(5):
-        if not click_if(page, role="button", name_regex="ver mais|mais produtos|carregar"): break
-
-def walk_json(obj):
-    PRICE={"price","salePrice","bestPrice","value","finalPrice","sellingPrice","Price","SellingPrice","unitPrice"}
-    NAME={"name","productName","itemName","title","Name","Title","product_name","description"}
-    out=[]
-    try:
-        if isinstance(obj, dict):
-            if "commertialOffer" in obj and isinstance(obj["commertialOffer"], dict):
-                raw = obj["commertialOffer"].get("Price") or obj["commertialOffer"].get("ListPrice")
-                nm = obj.get("name") or obj.get("productName") or obj.get("itemName") or ""
-                if raw is not None and nm:
-                    try: out.append({"name":str(nm), "price":float(raw)})
-                    except: pass
-            if any(k in obj for k in NAME) and any(k in obj for k in PRICE):
-                nm = next((str(obj[k]) for k in NAME if k in obj and obj[k]), "")
-                rv = next((obj[k] for k in PRICE if k in obj and obj[k] is not None), None)
-                if isinstance(rv,str): pr=money(rv)
-                elif isinstance(rv,(int,float)): pr=float(rv)
-                else: pr=None
-                if nm and pr is not None: out.append({"name":nm,"price":pr})
-            for v in obj.values(): out+=walk_json(v)
-        elif isinstance(obj, list):
-            for x in obj: out+=walk_json(x)
-    except Exception: pass
-    return out
-
-def parse_inline(html):
-    items=[]
-    for pat in [r"__STATE__\s*=\s*({.*?});</script>", r"__NEXT_DATA__\s*=\s*({.*?});</script>"]:
-        for m in re.finditer(pat, html, re.S):
-            try: items+=walk_json(json.loads(m.group(1)))
-            except Exception: pass
-    for m in re.finditer(r"<script[^>]*application/json[^>]*>(.*?)</script>", html, re.S|re.I):
-        try: items+=walk_json(json.loads(m.group(1)))
-        except Exception: pass
-    # dedup
-    out,seen=[],set()
-    for it in items:
-        k=(it["name"], round(float(it["price"]),2))
-        if k not in seen: out.append(it); seen.add(k)
-    return out
 
 def extract_cards(html):
     items=[]
@@ -326,178 +215,121 @@ def extract_cards(html):
         if k not in seen: out.append(it); seen.add(k)
     return out
 
-def fetch_with_playwright(url, cep):
-    ensure_chromium()
-    captured=[]
-    html=""
-    try:
-        with sync_playwright() as p:
-            browser=p.chromium.launch(headless=True, args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-zygote","--single-process"])
-            ctx=browser.new_context()
-            page=ctx.new_page()
-            page.set_default_timeout(30000)
+def collect_by_search(host, cep):
+    """Abre host, define CEP; para cada item do catálogo, consulta /busca?ft=... e pega 1º match."""
+    results=[]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-zygote","--single-process"],
+        )
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+            locale="pt-BR", timezone_id="America/Fortaleza",
+        )
+        page = ctx.new_page()
+        page.set_default_timeout(30000)
 
-            def on_response(res):
+        # abrir e configurar loja/cep
+        page.goto(host, wait_until="domcontentloaded")
+        set_store_and_cep(page, cep, host)
+
+        # função de validação
+        def is_match(section, key, name):
+            sec, k = match_key(name)
+            return sec==section and k==key
+
+        # buscar item a item
+        for section, items in CATALOG.items():
+            for it in items:
+                q = it.get("q") or it["key"]
+                url = f"{host}/busca?ft={urllib.parse.quote(q)}"
                 try:
-                    ct=(res.headers or {}).get("content-type","").lower()
-                    if "application/json" in ct or res.url.endswith(".json"):
-                        try: data=res.json()
-                        except Exception:
-                            try: data=json.loads(res.text())
-                            except Exception: data=None
-                        if data is not None:
-                            captured.extend(walk_json(data))
-                except Exception: pass
-            page.on("response", on_response)
+                    page.goto(url, wait_until="domcontentloaded")
+                    # rolar p/ carregar vitrine
+                    for _ in range(10):
+                        page.mouse.wheel(0, 1800); page.wait_for_timeout(250)
+                    html = page.content()
+                    cards = extract_cards(html)
+                    hit=None
+                    for c in cards[:12]:
+                        if is_match(section, it["key"], c["name"]):
+                            hit=c; break
+                    if hit:
+                        results.append({"section":section,"key":it["key"],"name":hit["name"],"price":float(hit["price"])})
+                except Exception:
+                    pass
 
-            try: page.goto(url, wait_until="domcontentloaded")
-            except PwTimeout: pass
+        ctx.close(); browser.close()
+    return results
 
-            host=f"{urlparse(page.url).scheme}://{urlparse(page.url).netloc}"
-            set_store_and_cep(page, cep, host=host)
-            # garantir que estamos na listagem
-            if "centerbox" in host:
-                page.goto(f"{host}/clube", wait_until="domcontentloaded")
-            elif "saoluiz" in host or "mercadinho" in host:
-                page.goto(f"{host}/ofertas", wait_until="domcontentloaded")
-            wait_prices(page); scroll_more(page)
-            html=page.content()
-            ctx.close(); browser.close()
-    except Exception:
-        pass
-    return html, captured
+# -------------------- UI --------------------
+st.set_page_config(page_title="Comparador de Supermercados", layout="wide")
+st.title("🛒 Comparador — cole os links e, se precisar, um CEP")
 
-def fetch_with_requests_html(url):
-    # fallback quando Chromium não pôde rodar
-    try:
-        from requests_html import HTMLSession
-        s=HTMLSession()
-        r=s.get(url, timeout=35)
-        r.html.render(timeout=70, sleep=6, scrolldown=16)
-        return r.html.html
-    except Exception:
-        return ""
+c1,c2 = st.columns(2)
+with c1: url1 = st.text_input("🔗 URL do Supermercado #1", "https://loja.centerbox.com.br/loja/58")
+with c2: url2 = st.text_input("🔗 URL do Supermercado #2", "https://mercadinhossaoluiz.com.br/loja/355")
+cep = st.text_input("📍 CEP (opcional — alguns sites só liberam preços após definir loja)", "60761-280")
+go = st.button("Comparar")
 
-def fetch(url, cep):
-    html, cap = fetch_with_playwright(url, cep)
-    if not html:
-        html = fetch_with_requests_html(url)
-    return html, cap
-
-def map_prices(items):
-    mapped={}
-    for it in items:
-        sec,key=match_key(it["name"])
-        if not sec: continue
-        cur=mapped.get((sec,key))
-        if cur is None or it["price"]<cur: mapped[(sec,key)] = float(it["price"])
-    return mapped
-
-def missing_keys(mapped):
-    want=set()
+def build_table(map_prices, label):
+    rows=[]
     for section, items in CATALOG.items():
         for it in items:
-            if (section, it["key"]) not in mapped:
-                want.add((section, it["key"]))
-    return want
+            price = map_prices.get((section,it["key"]))
+            rows.append({"Seção":section, "Produto":it["key"], label:(f"R$ {price:.2f}" if price is not None else "—")})
+    return pd.DataFrame(rows)
 
-def search_fill(host, cep, already_map, need_keys):
-    # usa /busca?ft=… pra completar
-    extra=[]
-    try:
-        with sync_playwright() as p:
-            browser=p.chromium.launch(headless=True, args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu","--no-zygote","--single-process"])
-            ctx=browser.new_context(); pg=ctx.new_page(); pg.set_default_timeout(25000)
-            pg.goto(host, wait_until="domcontentloaded"); set_store_and_cep(pg, cep, host=host)
-            for section, items in CATALOG.items():
-                for it in items:
-                    key=it["key"]
-                    if key not in need_keys: continue
-                    q=it.get("q") or key
-                    url=f"{host}/busca?ft={urllib.parse.quote(q)}"
-                    try:
-                        pg.goto(url, wait_until="domcontentloaded")
-                        wait_prices(pg); scroll_more(pg, 8)
-                        html=pg.content()
-                        for hit in extract_cards(html)[:10]:
-                            s,k=match_key(hit["name"])
-                            if s==section and k==key and (s,k) not in already_map:
-                                extra.append({"name":hit["name"],"price":float(hit["price"])})
-                                break
-                    except Exception: pass
-            ctx.close(); browser.close()
-    except Exception:
-        pass
-    # dedup
-    out,seen=[],set()
-    for it in extra:
-        k=(it["name"], round(float(it["price"]),2))
-        if k not in seen: out.append(it); seen.add(k)
-    return out
-
-# ------------------- APP FLOW -------------------
 if go:
-    if not url1 or not url2:
-        st.error("Manda os dois links 😉"); st.stop()
+    with st.spinner("Buscando preços item a item…"):
+        host1=f"{urlparse(url1).scheme}://{urlparse(url1).netloc}"
+        host2=f"{urlparse(url2).scheme}://{urlparse(url2).netloc}"
+        res1 = collect_by_search(host1, cep)
+        res2 = collect_by_search(host2, cep)
 
-    with st.spinner("Abrindo páginas, definindo loja/CEP e coletando preços…"):
-        html1, net1 = fetch(url1, cep)
-        html2, net2 = fetch(url2, cep)
+    # mapeia menor preço por produto
+    map1, map2 = {}, {}
+    for r in res1:
+        k=(r["section"], r["key"])
+        map1[k] = min(map1.get(k, 1e9), r["price"])
+    for r in res2:
+        k=(r["section"], r["key"])
+        map2[k] = min(map2.get(k, 1e9), r["price"])
 
-    items1 = extract_cards(html1) + net1 + parse_inline(html1)
-    items2 = extract_cards(html2) + net2 + parse_inline(html2)
+    name1 = urlparse(url1).netloc.replace("www.","")
+    name2 = urlparse(url2).netloc.replace("www.","")
 
-    # dedup
-    def dedup(items):
-        out,seen=[],set()
-        for it in items:
-            if not it.get("name") or not isinstance(it.get("price"), (int,float)): continue
-            k=(it["name"], round(float(it["price"]),2))
-            if k not in seen: out.append({"name":it["name"],"price":float(it["price"])}); seen.add(k)
-        return out
-    items1, items2 = dedup(items1), dedup(items2)
+    # tabelas por seção
+    st.markdown("## Resultados")
+    for section in CATALOG.keys():
+        data=[]
+        for it in CATALOG[section]:
+            k=(section, it["key"])
+            v1=map1.get(k); v2=map2.get(k)
+            data.append({
+                "Produto": it["key"],
+                name1: f"R$ {v1:.2f}" if isinstance(v1,(int,float)) else "—",
+                name2: f"R$ {v2:.2f}" if isinstance(v2,(int,float)) else "—",
+            })
+        st.subheader(section)
+        st.dataframe(pd.DataFrame(data), use_container_width=True)
 
-    host1=f"{urlparse(url1).scheme}://{urlparse(url1).netloc}"
-    host2=f"{urlparse(url2).scheme}://{urlparse(url2).netloc}"
-
-    map1, map2 = map_prices(items1), map_prices(items2)
-
-    miss1 = missing_keys(map1)
-    miss2 = missing_keys(map2)
-
-    if len(miss1)>6:
-        need={k for _,k in miss1}
-        add=search_fill(host1, cep, map1, need)
-        items1+=add; map1 = map_prices(items1)
-    if len(miss2)>6:
-        need={k for _,k in miss2}
-        add=search_fill(host2, cep, map2, need)
-        items2+=add; map2 = map_prices(items2)
-
-    name1=urlparse(url1).netloc.replace("www.","")
-    name2=urlparse(url2).netloc.replace("www.","")
-
+    # score
     total1=total2=0.0; sum1=sum2=0.0; pairs=0
-
-    st.markdown("---")
-    for section, products in CATALOG.items():
-        rows=[]
-        for it in products:
-            key=it["key"]
-            v1=map1.get((section,key)); v2=map2.get((section,key))
-            rows.append({"Produto":key, name1:(f"R$ {v1:.2f}" if isinstance(v1,(int,float)) else "—"),
-                                   name2:(f"R$ {v2:.2f}" if isinstance(v2,(int,float)) else "—")})
+    for section, items in CATALOG.items():
+        for it in items:
+            k=(section,it["key"])
+            v1=map1.get(k); v2=map2.get(k)
             if isinstance(v1,(int,float)) and isinstance(v2,(int,float)):
                 if v1<v2: total1+=1
                 elif v2<v1: total2+=1
                 else: total1+=0.5; total2+=0.5
                 sum1+=v1; sum2+=v2; pairs+=1
-        st.subheader(section)
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-    st.markdown("---"); st.markdown("### 🏁 Resultado")
     def fmt(x): return f"{x:.1f}".replace(".0","")
-    msg=f"**{name1}** {fmt(total1)} × {fmt(total2)} **{name2}** (critério: mais itens com menor preço)"
+    msg=f"**{name1}** {fmt(total1)} × {fmt(total2)} **{name2}** (mais itens com menor preço)"
     if total1>total2: winner=name1
     elif total2>total1: winner=name2
     else:
@@ -506,7 +338,12 @@ if go:
             elif sum2<sum1: winner=name2; msg+=f". Desempate pela menor soma (R$ {sum2:.2f} vs R$ {sum1:.2f})."
             else: winner=f"{name1} / {name2}"; msg+=". Empate após soma."
         else:
-            winner=f"{name1} / {name2}"; msg+=". Empate técnico."
+            winner=f"{name1} / {name2}"; msg+=". Empate técnico (poucos itens encontrados)."
+
     st.success(f"🏆 **Vencedor:** {winner}\n\n{msg}")
 
-st.caption("Dica: cole /loja/XX (ou /clube /ofertas). O app aceita cookies, define CEP, seleciona loja e raspa os preços automaticamente.")
+    with st.expander("🔎 Debug (itens capturados)"):
+        st.write(name1, res1[:30])
+        st.write(name2, res2[:30])
+
+st.caption("Eu defino CEP/loja automaticamente e busco cada item em /busca?ft=…; isso evita vitrines que escondem preço.")
