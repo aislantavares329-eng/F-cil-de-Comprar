@@ -1,12 +1,11 @@
-# app.py — Comparador "busca direta" (robusto)
-# - Sem passos manuais: instala libs e Chromium se faltar
-# - Abre cada site, aceita cookies, define CEP/loja (Centerbox: "CLIQUE E RETIRE")
-# - Para CADA produto do catálogo, abre /busca?ft=... e pega o 1º card que casa
-# - Mostra tabela por seção e decide o vencedor
+# app.py — Comparador de supermercados com fallback automático (Playwright → requests_html)
+# - Auto-instala libs (pip) e tenta instalar Chromium (silencioso)
+# - Se Playwright falhar ao lançar o browser, cai para requests_html (Pyppeteer)
+# - Define CEP/loja quando possível; em seguida busca item-a-item via /busca?ft=...
+# - Tabelas por seção e “vencedor” pelo critério de mais itens com menor preço
 
 import sys, subprocess, importlib, re, json, unicodedata, urllib.parse
 from urllib.parse import urlparse
-import time
 
 # -------------------- AUTO-BOOTSTRAP --------------------
 NEEDED = [
@@ -15,6 +14,7 @@ NEEDED = [
     ("bs4", "beautifulsoup4>=4.12"),
     ("lxml", "lxml>=5.2"),
     ("playwright", "playwright>=1.45"),
+    ("requests_html", "requests-html==0.10.0"),  # fallback
 ]
 
 def pip_install(spec):
@@ -24,25 +24,36 @@ def pip_install(spec):
         pass
 
 for mod, spec in NEEDED:
-    try: importlib.import_module(mod)
-    except Exception: pip_install(spec)
+    try:
+        importlib.import_module(mod)
+    except Exception:
+        pip_install(spec)
 
 import streamlit as st, pandas as pd
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+
+# tentar importar playwright; se não rolar, marcaremos para usar fallback
+PLAYWRIGHT_OK = True
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:
+    PLAYWRIGHT_OK = False
 
 def ensure_chromium():
+    """Tenta baixar o runtime do Chromium para o Playwright (silencioso)."""
     try:
-        subprocess.run([sys.executable,"-m","playwright","install","chromium","--with-deps"],
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        subprocess.run([sys.executable,"-m","playwright","install","chromium"],
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-if "chrom_ok" not in st.session_state:
-    with st.spinner("Preparando ambiente (1ª vez pode demorar)…"):
-        ensure_chromium()
-    st.session_state["chrom_ok"] = True
+# roda uma vez por sessão
+if "boot" not in st.session_state:
+    with st.spinner("Preparando ambiente (primeira vez pode demorar)…"):
+        if PLAYWRIGHT_OK:
+            ensure_chromium()
+    st.session_state["boot"] = True
 
 # -------------------- Helpers de texto/tamanho --------------------
 def norm(s:str)->str:
@@ -145,47 +156,7 @@ def match_key(name):
             return section, it["key"]
     return None, None
 
-# -------------------- Scraping: abrir site, definir CEP, BUSCAR item --------------------
-def click_if(page, role=None, name_regex=None, css=None, t=900):
-    try:
-        if css:
-            el = page.locator(css)
-            if el and el.is_visible(): el.click(); page.wait_for_timeout(t); return True
-        if role and name_regex:
-            btn = page.get_by_role(role, name=re.compile(name_regex, re.I)).first
-            if btn and btn.is_visible(): btn.click(); page.wait_for_timeout(t); return True
-    except Exception:
-        return False
-    return False
-
-def set_store_and_cep(page, cep, host):
-    # cookies
-    for pat in ["Aceitar","Aceito","Concordo","Permitir","OK","Prosseguir","Continuar","Fechar"]:
-        click_if(page, role="button", name_regex=pat, t=600)
-    # abrir modal
-    click_if(page, role="button", name_regex="Selecion(e|ar).+método|Entrega|Retirada|loja", t=600)
-    # CEP
-    if cep:
-        ok=False
-        for css in ['input[placeholder*="CEP"]','input[placeholder*="cep"]','input[type="tel"]','input[name*="cep"]']:
-            try:
-                el=page.locator(css).first
-                if el and el.is_visible(): el.fill(cep); page.wait_for_timeout(400); ok=True; break
-            except Exception: pass
-        if not ok:
-            try: page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep); page.wait_for_timeout(400)
-            except Exception: pass
-    # Centerbox → “CLIQUE E RETIRE” (ou entrega)
-    if "centerbox" in host:
-        clicked = click_if(page, role="button", name_regex=r"CLIQUE\s*E\s*RETIRE|Retirar|Retire", t=900)
-        if not clicked: click_if(page, role="button", name_regex=r"RECEBA\s*EM\s*CASA|Entrega", t=900)
-    # escolher 1ª loja se lista aparecer
-    for pat in ["Selecionar esta loja","Usar esta loja","Selecionar","Usar loja","Escolher esta loja","Usar unidade"]:
-        if click_if(page, role="button", name_regex=pat, t=900): break
-    # confirmar
-    for pat in ["Confirmar","Aplicar","Continuar","Salvar","OK"]:
-        if click_if(page, role="button", name_regex=pat, t=800): break
-
+# -------------------- Parsing comum de cards --------------------
 def extract_cards(html):
     items=[]
     soup=BeautifulSoup(html or "","lxml")
@@ -215,9 +186,11 @@ def extract_cards(html):
         if k not in seen: out.append(it); seen.add(k)
     return out
 
-def collect_by_search(host, cep):
-    """Abre host, define CEP; para cada item do catálogo, consulta /busca?ft=... e pega 1º match."""
+# -------------------- Playwright (quando possível) --------------------
+def pw_collect_by_search(host, cep):
+    """Coleta via Playwright — define CEP/loja e busca cada item."""
     results=[]
+    from playwright.sync_api import sync_playwright  # import local (se disponível)
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -231,37 +204,111 @@ def collect_by_search(host, cep):
         page = ctx.new_page()
         page.set_default_timeout(30000)
 
-        # abrir e configurar loja/cep
-        page.goto(host, wait_until="domcontentloaded")
-        set_store_and_cep(page, cep, host)
+        # helpers de clique
+        def click_if(role=None, name_regex=None, css=None, t=900):
+            try:
+                if css:
+                    el = page.locator(css)
+                    if el and el.is_visible(): el.click(); page.wait_for_timeout(t); return True
+                if role and name_regex:
+                    btn = page.get_by_role(role, name=re.compile(name_regex, re.I)).first
+                    if btn and btn.is_visible(): btn.click(); page.wait_for_timeout(t); return True
+            except Exception:
+                return False
+            return False
 
-        # função de validação
+        def set_store_and_cep():
+            # abrir host
+            page.goto(host, wait_until="domcontentloaded")
+            # cookies
+            for pat in ["Aceitar","Aceito","Concordo","Permitir","OK","Prosseguir","Continuar","Fechar"]:
+                click_if(role="button", name_regex=pat, t=600)
+            # abrir modal
+            click_if(role="button", name_regex="Selecion(e|ar).+método|Entrega|Retirada|loja", t=600)
+            # CEP
+            if cep:
+                ok=False
+                for css in ['input[placeholder*="CEP"]','input[placeholder*="cep"]','input[type="tel"]','input[name*="cep"]']:
+                    try:
+                        el=page.locator(css).first
+                        if el and el.is_visible(): el.fill(cep); page.wait_for_timeout(400); ok=True; break
+                    except Exception: pass
+                if not ok:
+                    try: page.get_by_placeholder(re.compile("CEP", re.I)).fill(cep); page.wait_for_timeout(400)
+                    except Exception: pass
+            # Centerbox → “CLIQUE E RETIRE” (ou entrega)
+            if "centerbox" in host:
+                clicked = click_if(role="button", name_regex=r"CLIQUE\s*E\s*RETIRE|Retirar|Retire", t=900)
+                if not clicked: click_if(role="button", name_regex=r"RECEBA\s*EM\s*CASA|Entrega", t=900)
+            # lista de lojas
+            for pat in ["Selecionar esta loja","Usar esta loja","Selecionar","Usar loja","Escolher esta loja","Usar unidade"]:
+                if click_if(role="button", name_regex=pat, t=900): break
+            # confirmar
+            for pat in ["Confirmar","Aplicar","Continuar","Salvar","OK"]:
+                if click_if(role="button", name_regex=pat, t=800): break
+
+        set_store_and_cep()
+
         def is_match(section, key, name):
             sec, k = match_key(name)
             return sec==section and k==key
 
-        # buscar item a item
         for section, items in CATALOG.items():
             for it in items:
                 q = it.get("q") or it["key"]
                 url = f"{host}/busca?ft={urllib.parse.quote(q)}"
                 try:
                     page.goto(url, wait_until="domcontentloaded")
-                    # rolar p/ carregar vitrine
+                    # rolar para carregar a vitrine
                     for _ in range(10):
                         page.mouse.wheel(0, 1800); page.wait_for_timeout(250)
                     html = page.content()
-                    cards = extract_cards(html)
-                    hit=None
-                    for c in cards[:12]:
+                    for c in extract_cards(html)[:12]:
                         if is_match(section, it["key"], c["name"]):
-                            hit=c; break
-                    if hit:
-                        results.append({"section":section,"key":it["key"],"name":hit["name"],"price":float(hit["price"])})
+                            results.append({"section":section,"key":it["key"],"name":c["name"],"price":float(c["price"])})
+                            break
                 except Exception:
                     pass
 
         ctx.close(); browser.close()
+    return results
+
+# -------------------- Fallback: requests_html --------------------
+def rhtml_collect_by_search(host, cep):
+    """
+    Coleta com requests_html (Pyppeteer). Não conseguimos clicar no modal de CEP,
+    mas muitos sites exibem preços mesmo assim. Se o modal bloquear geral, ficará '—'.
+    """
+    from requests_html import HTMLSession
+    s = HTMLSession()
+    results=[]
+
+    def fetch_search(q):
+        url = f"{host}/busca?ft={urllib.parse.quote(q)}"
+        try:
+            r = s.get(url, timeout=35)
+            # tenta renderizar JS
+            r.html.render(timeout=70, sleep=5, scrolldown=16)
+            return r.html.html
+        except Exception:
+            try:
+                return r.text
+            except Exception:
+                return ""
+
+    def is_match(section, key, name):
+        sec, k = match_key(name)
+        return sec==section and k==key
+
+    for section, items in CATALOG.items():
+        for it in items:
+            q = it.get("q") or it["key"]
+            html = fetch_search(q)
+            if not html: continue
+            for c in extract_cards(html)[:12]:
+                if is_match(section, it["key"], c["name"]):
+                    results.append({"section":section,"key":it["key"],"name":c["name"],"price":float(c["price"])})
+                    break
     return results
 
 # -------------------- UI --------------------
@@ -274,20 +321,30 @@ with c2: url2 = st.text_input("🔗 URL do Supermercado #2", "https://mercadinho
 cep = st.text_input("📍 CEP (opcional — alguns sites só liberam preços após definir loja)", "60761-280")
 go = st.button("Comparar")
 
-def build_table(map_prices, label):
-    rows=[]
-    for section, items in CATALOG.items():
-        for it in items:
-            price = map_prices.get((section,it["key"]))
-            rows.append({"Seção":section, "Produto":it["key"], label:(f"R$ {price:.2f}" if price is not None else "—")})
-    return pd.DataFrame(rows)
+def run_collect(host, cep):
+    # 1) tenta Playwright
+    if PLAYWRIGHT_OK:
+        try:
+            return pw_collect_by_search(host, cep), "playwright"
+        except Exception:
+            pass
+    # 2) fallback requests_html
+    try:
+        return rhtml_collect_by_search(host, cep), "requests_html"
+    except Exception:
+        return [], "none"
 
 if go:
-    with st.spinner("Buscando preços item a item…"):
+    with st.spinner("Coletando preços item a item (com fallback automático)…"):
         host1=f"{urlparse(url1).scheme}://{urlparse(url1).netloc}"
         host2=f"{urlparse(url2).scheme}://{urlparse(url2).netloc}"
-        res1 = collect_by_search(host1, cep)
-        res2 = collect_by_search(host2, cep)
+        res1, mode1 = run_collect(host1, cep)
+        res2, mode2 = run_collect(host2, cep)
+
+    name1 = urlparse(url1).netloc.replace("www.","")
+    name2 = urlparse(url2).netloc.replace("www.","")
+
+    st.info(f"{name1}: modo **{mode1}** · {name2}: modo **{mode2}**")
 
     # mapeia menor preço por produto
     map1, map2 = {}, {}
@@ -297,9 +354,6 @@ if go:
     for r in res2:
         k=(r["section"], r["key"])
         map2[k] = min(map2.get(k, 1e9), r["price"])
-
-    name1 = urlparse(url1).netloc.replace("www.","")
-    name2 = urlparse(url2).netloc.replace("www.","")
 
     # tabelas por seção
     st.markdown("## Resultados")
@@ -342,8 +396,8 @@ if go:
 
     st.success(f"🏆 **Vencedor:** {winner}\n\n{msg}")
 
-    with st.expander("🔎 Debug (itens capturados)"):
+    with st.expander("🔎 Debug (amostras capturadas)"):
         st.write(name1, res1[:30])
         st.write(name2, res2[:30])
 
-st.caption("Eu defino CEP/loja automaticamente e busco cada item em /busca?ft=…; isso evita vitrines que escondem preço.")
+st.caption("O app tenta Playwright; se não der, usa requests_html. Alguns sites exigem loja/CEP rígidos e podem esconder preços no fallback.")
