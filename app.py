@@ -1,8 +1,8 @@
-# app.py — Comparador de Encartes (PDF/JPG) por supermercado — v7
-# - Detecta automaticamente "Frangolândia" / "Mix Mateus" (e outras variações)
-# - Amostra só PT-BR: Supermercado | Produto | Preço
-# - Matching entre encartes mais tolerante (une nomes parecidos)
-# - OCR automático (easyocr -> pytesseract + tesseract-ocr), com fallback silencioso
+# app.py — Comparador de Encartes (PDF/JPG) por supermercado — v8
+# - Detecta automaticamente "Frangolândia" / "Mix Mateus" (e variações "matheus")
+# - Amostra FIXA em PT-BR: Supermercado | Produto | Preço
+# - Matching entre encartes mais tolerante (token_set + partial_ratio)
+# - OCR automático com fallback silencioso
 
 import sys, subprocess, importlib, io, os, re, unicodedata, shutil, platform
 from pathlib import Path
@@ -45,7 +45,7 @@ def try_import(name):
 
 def ensure_easyocr():
     global HAS_EASYOCR
-    if try_import("easyocr"): 
+    if try_import("easyocr"):
         HAS_EASYOCR = True; return True
     if pipq("easyocr>=1.7.1") and try_import("easyocr"):
         HAS_EASYOCR = True; return True
@@ -74,10 +74,8 @@ def ensure_pytesseract_and_binary():
     return HAS_TESS and HAS_TESS_BIN
 
 def ensure_ocr():
-    # 1) easyocr (não precisa binário externo)
     if ensure_easyocr():
         return "easyocr"
-    # 2) pytesseract + binário
     if ensure_pytesseract_and_binary():
         return "tesseract"
     return None
@@ -90,6 +88,7 @@ def norm_txt(s:str)->str:
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace() or ch in "-_/.,+")
     return " ".join(s.split())
 
+# aceita "R$ 1,99" / "1,99" / "1.999,99"
 PRICE_RE = re.compile(r"(?:r\$\s*)?((?:\d{1,3}(?:[\.\s]\d{3})*|\d+)[,\.]\d{2})", re.I)
 
 STOP = {
@@ -100,17 +99,26 @@ STOP = {
     "clube","economia","leve","pague","leve2","pague1","rs","r$"
 }
 
-# nomes conhecidos + normalização
+# nomes conhecidos + normalização (inclui "matheus")
 KNOWN_STORES = [
-    "frangolandia","frangolândia","mix mateus","mateus","centerbox",
-    "são luiz","sao luiz","carrefour","assai","atacadão","atacadao",
+    "frangolandia","frangolândia","mix mateus","mateus","matheus","mix matheus",
+    "centerbox","sao luiz","são luiz","carrefour","assai","atacadão","atacadao",
     "super lagoa","pao de acucar","pão de açúcar","guanabara","bh supermercados",
 ]
+
 NORMALIZE_STORE = {
     "frangolândia":"frangolandia",
-    "mateus":"mix mateus",
     "são luiz":"sao luiz",
+    "mateus":"mix mateus",
+    "matheus":"mix mateus",
+    "mix matheus":"mix mateus",
 }
+
+STORE_PATTERNS = [
+    (re.compile(r"\bfrango?landia\b", re.I), "frangolandia"),
+    (re.compile(r"\bmix\s*mat(e|é)us\b", re.I), "mix mateus"),
+    (re.compile(r"\bmat(e|é)us\b", re.I), "mix mateus"),
+]
 
 def to_price(s:str):
     if not s: return None
@@ -126,11 +134,16 @@ def to_price(s:str):
 def canonical(raw:str):
     n = norm_txt(raw)
     n = re.sub(PRICE_RE," ",n)
+    # normalizações simples de unidade
+    n = n.replace(" gr "," g ").replace(" litro "," l ").replace(" litros "," l ")
     n = " ".join(w for w in n.split() if w not in STOP and not w.isdigit())
     return n.strip(" -._")
 
 def similar(a,b,th=80):
-    return fuzz.token_set_ratio(a,b) >= th
+    # mais permissivo: token_set e partial_ratio
+    s1 = fuzz.token_set_ratio(a,b)
+    s2 = fuzz.partial_ratio(a,b)
+    return max(s1, s2) >= th
 
 # ------------------- leitura & OCR -------------------
 def ocr_image(img:Image.Image)->str:
@@ -161,10 +174,12 @@ def pdf_text_and_header(bts:bytes):
                         s = sp.get("text","").strip()
                         if not s: continue
                         page.append(s)
-                        if i==0 and len(s)<=42 and not any(ch.isdigit() for ch in s):
+                        # cabeçalho mais largo (aceita dígitos e até 64 chars)
+                        if i==0 and len(s)<=64:
                             spans.append((s, sp.get("size",0)))
             raw = "\n".join(page).strip()
             if len(raw) < 20:
+                # provavelmente imagem: OCR
                 pix = pg.get_pixmap(dpi=230)
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 raw = ocr_image(img)
@@ -174,23 +189,23 @@ def pdf_text_and_header(bts:bytes):
 def image_text_and_header(bts:bytes):
     img = Image.open(io.BytesIO(bts)).convert("RGB")
     t = ocr_image(img)
-    lines = [ln for ln in (t or "").splitlines() if ln.strip()][:12]
-    header = [(ln, 32) for ln in lines if ln and not any(ch.isdigit() for ch in ln)]
+    lines = [ln for ln in (t or "").splitlines() if ln.strip()][:15]
+    # trata primeiras linhas como "cabeçalho"
+    header = [(ln, 32) for ln in lines if ln]
     return t, header
 
 # ------------------- detectar supermercado -------------------
 def detect_market(text:str, header_spans:list, filename:str):
-    nfull = norm_txt(text)
+    nfull = norm_txt(text or "")
 
-    # atalhos diretos (robustos):
-    if "frangoland" in nfull:
-        return "frangolandia"
-    if ("mix" in nfull and "mateus" in nfull) or "mix mateus" in nfull:
-        return "mix mateus"
+    # 1) padrões fortes no texto inteiro
+    for rx, label in STORE_PATTERNS:
+        if rx.search(nfull):
+            return label
 
-    # fuzzy nos spans grandes + primeiras linhas
-    spans = sorted([(s,sz) for s,sz in header_spans if sz>=20], key=lambda x:-x[1])[:30]
-    cands = [s for s,_ in spans] + text.splitlines()[:120]
+    # 2) analisar spans grandes do 1º página
+    spans = sorted([(s,sz) for s,sz in (header_spans or []) if sz>=18], key=lambda x:-x[1])[:40]
+    cands = [s for s,_ in spans] + (text.splitlines()[:120] if text else [])
     for s in cands:
         n = norm_txt(s)
         best=None; score=0
@@ -200,8 +215,22 @@ def detect_market(text:str, header_spans:list, filename:str):
         if score>=80:
             return NORMALIZE_STORE.get(best, best)
 
-    # fallback: nome do arquivo
-    return norm_txt(Path(filename).stem.replace("_"," ").replace("-"," "))
+    # 3) nome do arquivo ajuda muito
+    stem = norm_txt(Path(filename).stem.replace("_"," ").replace("-"," "))
+    if stem:
+        for rx, label in STORE_PATTERNS:
+            if rx.search(stem):
+                return label
+        # fuzzy no nome
+        best=None; score=0
+        for ref in KNOWN_STORES:
+            sc=fuzz.token_set_ratio(stem, ref)
+            if sc>score: score=sc; best=ref
+        if score>=82:
+            return NORMALIZE_STORE.get(best, best)
+
+    # 4) se nada, devolve o "melhor palpite" legível
+    return (stem or "desconhecido").strip()
 
 # ------------------- parser de itens -------------------
 def parse_items(text:str):
@@ -215,7 +244,7 @@ def parse_items(text:str):
             price = to_price(m.group(1))
             if not price: continue
             left  = ctx[:m.start()].strip()[-160:]
-            right = ctx[m.end():].strip()[:100]
+            right = ctx[m.end():].strip()[:120]
             name  = (left + " " + right).strip()
             name  = re.sub(PRICE_RE," ",name).strip(" -._")
             if len(name)<3:
@@ -223,7 +252,7 @@ def parse_items(text:str):
             ncan = canonical(name)
             if len(ncan) < 4:
                 continue
-            # evita nomes que são só tamanho/medida
+            # evita nomes só de medida
             if re.fullmatch(r"(?:\d+(?:g|ml|kg|l)\s*){1,3}", ncan):
                 continue
             out.append({"name_raw":name, "price":float(price)})
@@ -237,16 +266,18 @@ def parse_items(text:str):
 
 def build_key(raw:str):
     base = canonical(raw)
-    base = re.sub(r"\b(\d+(?:g|ml|kg|l))\b(?:\s+\1\b)+","\\1",base)  # remove "100g 100g"
+    # remove duplicação "100g 100g"
+    base = re.sub(r"\b(\d+(?:g|ml|kg|l))\b(?:\s+\1\b)+","\\1",base)
     return base or raw
 
-def unify(rows, th=78):
-    keys=list({r["key"] for r in rows})
+# ------------------- unificação -------------------
+def unify_keys(keys, th=80):
     roots=[]; mapping={}
     for k in keys:
         found=None
         for r in roots:
-            if similar(k,r,th): found=r; break
+            if similar(k,r,th):
+                found=r; break
         if not found:
             roots.append(k); mapping[k]=k
         else:
@@ -307,28 +338,31 @@ if uploads and st.button("Comparar preços"):
             mercados_detectados.append(f"• {Path(f.name).name} → **{market}**")
 
             items = parse_items(text)
+            if not items:
+                continue
+            # gera linhas deste encarte
             rows=[]
             for it in items:
                 key = build_key(it["name_raw"])
                 rows.append({"market":market,"key":key,"name_raw":it["name_raw"],"price":it["price"]})
-            # unificação DENTRO do encarte (limpa duplicados)
-            mp = unify(rows, th=80)
-            for r in rows: r["key_root"]=mp[r["key"]]
+            # unificação DENTRO do encarte (mais rígida)
+            mp_in = unify_keys({r["key"] for r in rows}, th=85)
+            for r in rows: r["key_root"]=mp_in[r["key"]]
             all_rows.extend(rows)
 
     if not all_rows:
         st.error("Não encontrei preços. Se o ambiente bloqueou a instalação de OCR, o PDF precisa ter texto embutido.")
         st.stop()
 
-    # unificação ENTRE encartes (mais permissiva)
-    cross = unify(all_rows, th=76)
-    for r in all_rows: r["key_root"]=cross[r["key_root"]]
+    # unificação ENTRE encartes (mais permissiva para casar produtos similares)
+    cross_map = unify_keys({r["key_root"] for r in all_rows}, th=72)
+    for r in all_rows: r["key_root"]=cross_map[r["key_root"]]
 
-    # --- Mercados detectados (só informativo) ---
+    # --- Mercados detectados ---
     st.subheader("Mercados detectados")
     st.markdown("\n".join(mercados_detectados))
 
-    # --- Amostra PT-BR: APENAS 3 colunas (Supermercado | Produto | Preço) ---
+    # --- Amostra: EXATAMENTE 3 colunas em PT-BR ---
     df_all=pd.DataFrame(all_rows)
     amostra = df_all.rename(columns={"market":"Supermercado","name_raw":"Produto","price":"Preço"})[
         ["Supermercado","Produto","Preço"]
